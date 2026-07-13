@@ -1,0 +1,21 @@
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# ---- Local scratch: personal Skyrim saves & byte dumps — NEVER commit ----
+.scratch/
+
+# ---- Timestamped plugin/save backups ----
+*.bak
+
+# ---- Internal / private docs ----
+# VM access, SSH, personal projects, modlist, drafts. Kept local, out of git.
+# CLAUDE.md stays at repo root so Claude Code still auto-loads it (just untracked).
+CLAUDE.md
+docs/modding/

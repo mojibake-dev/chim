@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chim"
+version = "0.1.0"
+description = "Headless binary editing of Skyrim Special Edition plugin files (.esp/.esm) as a Python library and MCP server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "mojibake" }]
+keywords = ["skyrim", "esp", "esm", "bethesda", "plugin", "modding", "mcp"]
+
+dependencies = [
+    "mcp",
+    "esplib",
+]
+
+[project.optional-dependencies]
+# SSH RemoteHost + remote Papyrus compilation. Lazy-imported, so the core install
+# never needs it; only pull it in (`pip install chim[remote]` / `uv sync --extra
+# remote`) when editing a live install on another machine over SSH.
+remote = [
+    "paramiko",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+chim-mcp = "chim.server:main"
+
+[tool.setuptools]
+packages = ["chim", "chim.esp", "chim.save"]
+
+# esplib (the byte engine, since the 2026-07-11 rewrite) is NOT on PyPI, so uv
+# resolves it straight from GitHub. Pinned to a commit for reproducibility — bump
+# `rev` to update (then `uv lock`). Requires git on the machine running uv.
+[tool.uv.sources]
+esplib = { git = "https://github.com/BadDogSkyrim/esplib.git", rev = "fb4e2759dac816453fff12e73d88c7101088006a" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
