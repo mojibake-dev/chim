@@ -24,6 +24,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -319,6 +320,111 @@ def extract_bsa_assets(bsa_path: str, data_dir: str, name: str, manifest_dir: st
     manifest = {"name": name, "data_dir": data_dir, "cfg": None, "plugins": [], "archives": [],
                 "files": copied, "cfg_added": [],
                 "new_file_count": sum(1 for c in copied if not c["preexisting"]), "dry_run": dry_run}
+    if not dry_run:
+        os.makedirs(manifest_dir, exist_ok=True)
+        with open(os.path.join(manifest_dir, name + ".json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=1)
+    return manifest
+
+
+# --------------------------------------------------------------------------- #
+# Mesh-driven texture resolution (Morrowind / OpenMW)
+# --------------------------------------------------------------------------- #
+#
+# A Morrowind NIF references its textures by name (sometimes with a leading
+# `Textures\`, sometimes bare, sometimes in a subdir) and by *whatever* extension
+# the author used (.tga/.bmp) even when the asset ships as .dds -- OpenMW
+# substitutes the extension at load. So resolving "the textures this mesh needs"
+# means matching by STEM (basename minus extension) and normalising the path.
+
+TEX_EXTS = (".dds", ".tga", ".bmp")
+_TEX_REF_RE = re.compile(rb"[ -~]{3,}\.(?:tga|dds|bmp|TGA|DDS|BMP)")
+
+
+def _stem(path: str) -> str:
+    """Basename without extension, separator-agnostic (Morrowind refs use ``\\``,
+    which isn't a path separator off Windows)."""
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return os.path.splitext(base)[0]
+
+
+def mesh_texture_refs(mesh_path: str) -> set:
+    """Texture references in a Morrowind NIF, as ``Textures``-relative paths (a
+    leading ``Textures\\`` is stripped so all refs share one convention)."""
+    out = set()
+    with open(mesh_path, "rb") as f:
+        data = f.read()
+    for m in _TEX_REF_RE.findall(data):
+        rp = m.decode("cp1252", "replace").replace("/", "\\")
+        if rp.lower().startswith("textures\\"):
+            rp = rp[9:]
+        out.add(rp)
+    return out
+
+
+def texture_resolvable(data_dir: str, rel: str, vanilla_stems: Optional[set] = None) -> bool:
+    """Whether a ``Textures``-relative ref is already available -- loose in
+    ``data_dir/Textures`` under ANY of .dds/.tga/.bmp (OpenMW substitutes), or a
+    vanilla-BSA stem."""
+    rel_os = rel.replace("\\", os.sep).replace("/", os.sep)
+    stem_path = os.path.join(data_dir, "Textures", os.path.splitext(rel_os)[0])
+    if any(os.path.exists(stem_path + e) for e in TEX_EXTS):
+        return True
+    if vanilla_stems:
+        return _stem(rel).lower() in vanilla_stems
+    return False
+
+
+def _bsa_texture_stems(bsa_path: str) -> set:
+    b = Bsa(path=bsa_path)
+    return {_stem(n).lower() for n in b.names() if n.lower().startswith("textures\\")}
+
+
+def extract_bsa_for_meshes(bsa_path: str, data_dir: str, name: str, manifest_dir: str,
+                           mesh_paths: Sequence[str], vanilla_bsas: Optional[Sequence[str]] = None,
+                           dry_run: bool = False) -> Dict[str, Any]:
+    """Scan ``mesh_paths`` (Morrowind NIFs) for texture references and pull, from the
+    BSA, only the ones **not already resolvable** (loose in ``data_dir`` or vanilla)
+    -- matched by **stem** so a mesh's ``.tga`` ref grabs the archive's ``.dds``
+    (OpenMW substitutes the extension). Each is placed at
+    ``data_dir/Textures/<ref-dir>/<stem>.<archive-ext>`` (the mesh's ref path, not the
+    archive's), and recorded in a manifest for ``uninstall``."""
+    bsa = Bsa(path=bsa_path)
+    by_stem: Dict[str, str] = {}
+    for n in bsa.names():
+        if n.lower().startswith("textures\\"):
+            by_stem.setdefault(_stem(n).lower(), n)
+    vstems: set = set()
+    for vb in (vanilla_bsas or []):
+        try:
+            vstems |= _bsa_texture_stems(vb)
+        except Exception:
+            pass
+    refs: set = set()
+    for mp in mesh_paths:
+        try:
+            refs |= mesh_texture_refs(mp)
+        except OSError:
+            pass
+    copied: List[Dict[str, Any]] = []
+    for rel in sorted(refs):
+        if texture_resolvable(data_dir, rel, vstems):
+            continue
+        src = by_stem.get(_stem(rel).lower())
+        if not src:
+            continue
+        rel_os = rel.replace("\\", os.sep).replace("/", os.sep)
+        dest_rel = os.path.join("Textures", os.path.dirname(rel_os),
+                                _stem(rel) + os.path.splitext(src)[1])
+        dest = os.path.join(data_dir, dest_rel)
+        pre = os.path.exists(dest)
+        if not dry_run:
+            bsa.extract(src, dest)
+        copied.append({"rel": dest_rel, "kind": "asset", "preexisting": pre})
+    manifest = {"name": name, "game": "openmw", "data_dir": data_dir, "cfg": None,
+                "plugins": [], "archives": [], "files": copied, "cfg_added": [],
+                "new_file_count": sum(1 for c in copied if not c["preexisting"]),
+                "refs_scanned": len(refs), "dry_run": dry_run}
     if not dry_run:
         os.makedirs(manifest_dir, exist_ok=True)
         with open(os.path.join(manifest_dir, name + ".json"), "w", encoding="utf-8") as f:

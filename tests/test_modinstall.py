@@ -161,6 +161,35 @@ def test_install_skyrim_data_root_and_plugins_txt(tmp_path):
     assert "*Cool.esp" not in open(pt).read() and "*Skyrim.esm" in open(pt).read()
 
 
+def test_mesh_texture_refs_normalises(tmp_path):
+    mesh = str(tmp_path / "m.nif")
+    open(mesh, "wb").write(b"\x00Em_kids\\aaa.dds\x00\x00Textures\\Em_kids\\bbb.tga\x00\x00ccc.bmp\x00")
+    assert M.mesh_texture_refs(mesh) == {r"Em_kids\aaa.dds", r"Em_kids\bbb.tga", "ccc.bmp"}
+
+
+def test_extract_bsa_for_meshes_stem_and_ext_sub(tmp_path):
+    # archive has the texture as .dds in a subdir; mesh references it as .tga, bare
+    files = {r"textures\warrhhair\foo.dds": b"DDS", r"textures\bar.dds": b"BAR"}
+    bp = str(tmp_path / "mod.bsa"); open(bp, "wb").write(_build_bsa(files))
+    mesh = str(tmp_path / "m.nif")
+    open(mesh, "wb").write(b"\x00foo.tga\x00\x00Textures\\baz.bmp\x00")   # baz not in bsa
+    data = str(tmp_path / "game"); md = str(tmp_path / "man")
+    rep = M.extract_bsa_for_meshes(bp, data, "tex", md, [mesh])
+    # foo.tga -> pulled warrhhair\foo.dds by STEM, placed at the mesh's ref path Textures\foo.dds
+    assert open(os.path.join(data, "Textures", "foo.dds"), "rb").read() == b"DDS"
+    assert rep["new_file_count"] == 1                                    # baz skipped (not in bsa)
+    # now already resolvable (foo.dds present) -> nothing new
+    assert M.extract_bsa_for_meshes(bp, data, "tex", md, [mesh])["new_file_count"] == 0
+
+
+def test_texture_resolvable_ext_substitution(tmp_path):
+    data = str(tmp_path / "game"); os.makedirs(os.path.join(data, "Textures", "sub"))
+    open(os.path.join(data, "Textures", "sub", "x.dds"), "wb").write(b"d")
+    assert M.texture_resolvable(data, r"sub\x.tga")          # .tga ref satisfied by .dds
+    assert not M.texture_resolvable(data, r"sub\y.tga")
+    assert M.texture_resolvable(data, "z.tga", vanilla_stems={"z"})
+
+
 def test_extract_bsa_assets_surgical(tmp_path):
     files = {r"meshes\a.nif": b"AAA", r"meshes\b.nif": b"BBB", r"textures\t.tga": b"TTT"}
     bp = str(tmp_path / "mod.bsa"); open(bp, "wb").write(_build_bsa(files))

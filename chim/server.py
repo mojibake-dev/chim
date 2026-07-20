@@ -1605,16 +1605,27 @@ def mod_install(archive: str, game: str = "openmw", include: Optional[Sequence[s
 
 @mcp.tool()
 def mod_extract_bsa(bsa: str, patterns: Optional[Sequence[str]] = None,
-                    names: Optional[Sequence[str]] = None, name: Optional[str] = None,
-                    dry_run: bool = True) -> Dict[str, Any]:
+                    names: Optional[Sequence[str]] = None, for_meshes: Optional[str] = None,
+                    name: Optional[str] = None, dry_run: bool = True) -> Dict[str, Any]:
     """Surgically extract a **subset** of a Morrowind mod's ``.bsa`` as loose files
     into ``Data Files`` — the "only the assets we use" path.
 
-    ``patterns`` are case-insensitive globs over archived paths (e.g.
-    ``["meshes\\\\em_kids\\\\*", "textures\\\\*corean*"]``); ``names`` is an explicit
-    archived-path list. ``bsa`` resolves against the Morrowind ``Data Files`` (or an
-    absolute path). **``dry_run=True`` by default** reports the match count. Backed
-    by chim's TES3 BSA reader; writes a manifest for ``mod_uninstall``.
+    Three ways to select what to pull:
+
+    * ``patterns`` — case-insensitive globs over archived paths (e.g.
+      ``["meshes\\\\em_kids\\\\*", "textures\\\\*corean*"]``).
+    * ``names`` — an explicit archived-path list.
+    * ``for_meshes`` — **the smart mode**: a glob of installed NIFs relative to the
+      Morrowind ``Data Files`` (e.g. ``"Meshes/Em_kids/*.nif"`` or ``"Meshes/**/*.nif"``).
+      chim scans those meshes for every texture they reference and pulls, from the
+      BSA, just the ones **not already present** — matched by **stem** so a mesh's
+      ``.tga`` reference grabs the archive's ``.dds`` (OpenMW substitutes the
+      extension), with a leading ``Textures\\`` normalised. Vanilla textures are
+      skipped. This is "pull the textures these meshes need," done correctly.
+
+    ``bsa`` resolves against the Morrowind ``Data Files`` (or an absolute path).
+    **``dry_run=True`` by default** reports the match count. Writes a manifest for
+    ``mod_uninstall``.
     """
     host = _make_host()
     _require_local(host)
@@ -1623,6 +1634,18 @@ def mod_extract_bsa(bsa: str, patterns: Optional[Sequence[str]] = None,
     nm = name or (os.path.splitext(os.path.basename(bpath))[0] + "_assets")
     if not dry_run:
         _mod_lock_or_raise(host)
+    if for_meshes:
+        import glob as _glob
+        pat = for_meshes if (for_meshes.startswith(("/", "\\")) or (len(for_meshes) >= 2 and for_meshes[1] == ":")) \
+            else os.path.join(data, for_meshes.replace("/", os.sep))
+        mesh_paths = [p for p in _glob.glob(pat, recursive=True) if p.lower().endswith(".nif")]
+        vanilla = [os.path.join(data, b) for b in ("Morrowind.bsa", "Tribunal.bsa", "Bloodmoon.bsa")
+                   if os.path.exists(os.path.join(data, b))]
+        rep = modinstall.extract_bsa_for_meshes(bpath, data, nm, md, mesh_paths,
+                                                vanilla_bsas=vanilla, dry_run=dry_run)
+        return {"bsa": bpath, "name": nm, "data_dir": data, "meshes_scanned": len(mesh_paths),
+                "texture_refs": rep.get("refs_scanned"), "matched": len(rep["files"]),
+                "new_file_count": rep["new_file_count"], "dry_run": dry_run}
     rep = modinstall.extract_bsa_assets(
         bpath, data, nm, md,
         patterns=list(patterns) if patterns else None,
