@@ -43,6 +43,8 @@ from mcp.server.fastmcp import FastMCP
 
 from .esp import ops, papyrus, safety
 from .save import analysis as save_analysis
+from .tes3 import ops as tes3_ops, analysis as tes3_analysis
+from . import modinstall
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +57,13 @@ ENV_SSH_HOST = "CHIM_SSH_HOST"
 ENV_DATA_DIR = "CHIM_DATA_DIR"
 #: Skyrim SE ``Saves`` directory ``.ess`` names are resolved against.
 ENV_SAVE_DIR = "CHIM_SAVE_DIR"
+#: Morrowind ``Data Files`` directory TES3 plugin names resolve against (OpenMW).
+ENV_MW_DATA_DIR = "CHIM_MW_DATA_DIR"
+#: openmw.cfg / Skyrim plugins.txt paths, mod-manifest dir, mod-archive source.
+ENV_OPENMW_CFG = "CHIM_OPENMW_CFG"
+ENV_PLUGINS_TXT = "CHIM_PLUGINS_TXT"
+ENV_MOD_MANIFESTS = "CHIM_MOD_MANIFESTS"
+ENV_DOWNLOADS = "CHIM_DOWNLOADS"
 
 
 def _make_host() -> safety.Host:
@@ -113,6 +122,35 @@ def _load(host: safety.Host, plugin: str):
     """Read + parse ``plugin`` from ``host`` (read-only path, no transaction)."""
     path = _resolve(host, plugin)
     return ops.load(host.read_file(path))
+
+
+def _mw_data_dir(host: safety.Host) -> str:
+    """Directory TES3 (Morrowind/OpenMW) plugin names resolve against.
+
+    Prefers ``CHIM_MW_DATA_DIR``; otherwise the stock Steam Morrowind
+    ``Data Files`` on a Windows/remote host, or the working directory locally.
+    """
+    override = os.environ.get(ENV_MW_DATA_DIR)
+    if override:
+        return override
+    if host.windows:
+        return safety.OPENMW_DEFAULT_DATA_DIR
+    return os.getcwd()
+
+
+def _resolve_tes3(host: safety.Host, plugin: str) -> str:
+    """Resolve a TES3 plugin *name* to a full path on ``host`` (abs paths pass through)."""
+    looks_absolute = (
+        plugin.startswith("/")
+        or plugin.startswith("\\\\")
+        or (len(plugin) >= 2 and plugin[1] == ":")
+    )
+    if looks_absolute:
+        return plugin
+    directory = _mw_data_dir(host)
+    if host.windows:
+        return directory.rstrip("\\/") + "\\" + plugin
+    return os.path.join(directory, plugin)
 
 
 def _save_dir(host: safety.Host) -> str:
@@ -1162,6 +1200,477 @@ def save_clean_orphans(
         "verify_unattached_instances": verify.get("unattached_instances"),
     })
     return report
+
+
+# --------------------------------------------------------------------------- #
+# Morrowind TES3 plugin editing — chim's third byte engine (:mod:`chim.tes3`)
+# --------------------------------------------------------------------------- #
+#
+# TES3 is a FLAT record list addressed by STRING editor-id (not a FormID), with
+# no GRUP tree and no compression. Read tools parse + report; mutating tools wrap
+# the same ``safety.transaction`` as the esp tools but inject the TES3 verify
+# predicate (``tes3_ops.walk_clean``) and the OpenMW lock-process list. ``plugin``
+# resolves against ``CHIM_MW_DATA_DIR`` (the Morrowind ``Data Files`` dir) or an
+# absolute path. Records are named by ``(type, id)`` — e.g. ``("RACE", "Rotfern")``.
+
+
+def _tes3_txn(host: safety.Host, path: str):
+    """A ``safety.transaction`` configured for TES3/OpenMW (verify + lock set)."""
+    return safety.transaction(
+        host, path,
+        verify_fn=tes3_ops.walk_clean,
+        lock_processes=safety.OPENMW_LOCK_PROCESSES,
+    )
+
+
+def _find_tes3(plug, type: str, id: str):
+    rec = tes3_ops.find_record(plug, _sig_str(type), id)
+    if rec is None:
+        raise ValueError(f"no {type!r} record with id {id!r}")
+    return rec
+
+
+@mcp.tool()
+def tes3_info(plugin: str) -> Dict[str, Any]:
+    """Read-only summary of a Morrowind TES3 plugin (``.esp``/``.esm``/``.omwaddon``).
+
+    Parses the flat record list and reports version, file type, author,
+    description, the master list, record count (stored HEDR value vs actual),
+    a record-type histogram, and ``walk_clean`` (the parsed plugin re-serialises
+    byte-identical — the TES3 integrity check). No mutation.
+    """
+    host = _make_host()
+    return tes3_analysis.tes3_info(host.read_file(_resolve_tes3(host, plugin)))
+
+
+@mcp.tool()
+def tes3_query(plugin: str, by: str, value: str = "", limit: int = 200) -> Dict[str, Any]:
+    """Read-only search over a TES3 plugin.
+
+    ``by`` selects the mode: ``type`` (every record of a 4-char type, e.g.
+    ``RACE``), ``id`` (records whose editor-id equals ``value``, case-insensitive),
+    ``id_regex`` (editor-id matches the regex ``value``), or ``master`` (the
+    MAST/DATA master list). Returns compact record summaries; ``limit`` caps rows
+    (with a ``truncated`` flag). No mutation.
+    """
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    plug = tes3_ops.load(host.read_file(path))
+    mode = by.lower()
+    if mode == "master":
+        return {"plugin": path, "masters": [{"name": n, "size": s}
+                                            for n, s in tes3_ops.masters(plug)]}
+    if mode == "type":
+        recs = list(tes3_ops.iter_records(plug, _sig_str(value)))
+    elif mode == "id":
+        recs = tes3_ops.find_by_id(plug, value)
+    elif mode == "id_regex":
+        recs = tes3_ops.find_by_id_regex(plug, value)
+    else:
+        raise ValueError(f"unknown query mode {by!r} (use type|id|id_regex|master)")
+    total = len(recs)
+    return {
+        "plugin": path, "by": mode, "value": value, "count": total,
+        "records": [tes3_ops.record_view(r) for r in recs[:int(limit)]],
+        "truncated": total > int(limit),
+    }
+
+
+@mcp.tool()
+def tes3_get_record(plugin: str, type: str, id: str) -> Dict[str, Any]:
+    """Read-only: a TES3 record's summary + its subrecord field views (opaque hex).
+
+    Identify the record by its 4-char ``type`` and editor-id ``id``
+    (case-insensitive). Each field view is ``{sig, index, size, payload_hex}`` —
+    the hex feeds straight back into the mutating tools. No mutation.
+    """
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    plug = tes3_ops.load(host.read_file(path))
+    rec = _find_tes3(plug, type, id)
+    out = tes3_ops.record_view(rec)
+    out["fields"] = tes3_ops.field_views(rec)
+    out["plugin"] = path
+    return out
+
+
+@mcp.tool()
+def tes3_get_subrecords(plugin: str, type: str, id: str,
+                        signature: Optional[str] = None) -> Dict[str, Any]:
+    """Read-only: the subrecords of a TES3 record (opaque hex), optionally filtered
+    to a single 4-char ``signature``. No mutation."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    plug = tes3_ops.load(host.read_file(path))
+    rec = _find_tes3(plug, type, id)
+    only = _sig_str(signature) if signature else None
+    return {"plugin": path, "type": rec.type, "id": tes3_ops.record_id(rec),
+            "fields": tes3_ops.field_views(rec, only)}
+
+
+@mcp.tool()
+def tes3_set_subrecord(plugin: str, type: str, id: str, signature: str,
+                       payload_hex: str, index: int = 0) -> Dict[str, Any]:
+    """Replace the ``index``-th ``signature`` subrecord's whole payload in a TES3
+    record. ``payload_hex`` is the new field bytes as hex (may grow or shrink).
+    Runs inside a safety transaction (lock -> backup -> edit -> verify -> restore)."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    sig = _sig_str(signature)
+    payload = _unhex(payload_hex)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = _find_tes3(plug, type, id)
+        tes3_ops.set_subrecord(rec, sig, payload, int(index))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": type, "id": id, "signature": signature,
+            "index": int(index), "new_size": len(payload), "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_patch_subrecord(plugin: str, type: str, id: str, signature: str,
+                         offset: int, bytes_hex: str, index: int = 0) -> Dict[str, Any]:
+    """Surgically overwrite bytes at ``offset`` inside a subrecord (same length).
+
+    The precision editor for fixed-width TES3 fields (the RADT race block,
+    author[32], a 32-byte NPCS ability id) — surrounding NUL padding is untouched.
+    ``bytes_hex`` must fit within the existing payload. Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    sig = _sig_str(signature)
+    new = _unhex(bytes_hex)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = _find_tes3(plug, type, id)
+        tes3_ops.patch_subrecord(rec, sig, int(offset), new, int(index))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": type, "id": id, "signature": signature,
+            "index": int(index), "offset": int(offset), "wrote": len(new),
+            "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_insert_subrecord(plugin: str, type: str, id: str, signature: str,
+                          payload_hex: str, after: Optional[str] = None,
+                          before: Optional[str] = None,
+                          at_index: Optional[int] = None) -> Dict[str, Any]:
+    """Insert a NEW subrecord into a TES3 record. Position: ``at_index`` >
+    ``after`` (right after the last such tag) > ``before`` (right before the first)
+    > append. Subrecord order is significant in TES3; this never re-sorts. Safety
+    transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    sig = _sig_str(signature)
+    payload = _unhex(payload_hex)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = _find_tes3(plug, type, id)
+        pos = tes3_ops.insert_subrecord(rec, sig, payload,
+                                        after=_sig_str(after) if after else None,
+                                        before=_sig_str(before) if before else None,
+                                        at_index=None if at_index is None else int(at_index))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": type, "id": id, "signature": signature,
+            "position": pos, "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_delete_subrecord(plugin: str, type: str, id: str, signature: str,
+                          index: int = 0) -> Dict[str, Any]:
+    """Remove the ``index``-th ``signature`` subrecord from a TES3 record. Safety
+    transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    sig = _sig_str(signature)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = _find_tes3(plug, type, id)
+        tes3_ops.delete_subrecord(rec, sig, int(index))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": type, "id": id, "signature": signature,
+            "index": int(index), "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_add_record(plugin: str, type: str, subrecords: List[List[str]],
+                    flags: int = 0) -> Dict[str, Any]:
+    """Author a NEW TES3 record and append it (bumping HEDR.numRecords by one).
+
+    ``subrecords`` is a list of ``[signature, payload_hex]`` pairs in on-wire order
+    (order is significant — e.g. a RACE is NAME, FNAM, RADT, NPCS…, DESC). Payloads
+    are composed agent-side; the engine stays byte-opaque, so any record type can
+    be authored without a typed decoder. This is the surface used to author the
+    Rotfern RACE + its BODY parts. Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    rtype = _sig_str(type)
+    pairs = []
+    for item in subrecords:
+        if len(item) != 2:
+            raise ValueError(f"each subrecord must be [signature, payload_hex], got {item!r}")
+        pairs.append((_sig_str(item[0]), _unhex(item[1])))
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = tes3_ops.build_record(rtype, pairs, flags=int(flags))
+        tes3_ops.add_record(plug, rec)
+        new_id = tes3_ops.record_id(rec)
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": rtype, "id": new_id,
+            "subrecords": [p[0] for p in pairs], "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_delete_records(plugin: str, type: str, ids: List[str]) -> Dict[str, Any]:
+    """Hard-remove records of ``type`` whose editor-id is in ``ids`` (shrinks
+    HEDR.numRecords). For a save-safe soft delete instead, use ``tes3_mark_deleted``.
+    Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    rtype = _sig_str(type)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        removed = tes3_ops.delete_records(plug, rtype, list(ids))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": rtype, "removed": removed, "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_mark_deleted(plugin: str, type: str, id: str) -> Dict[str, Any]:
+    """Morrowind soft-delete: set the record's DELETED flag AND add a ``DELE``
+    subrecord, leaving the record physically present (the convention the CS/OpenMW
+    read). Does not change HEDR.numRecords. Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        rec = _find_tes3(plug, type, id)
+        tes3_ops.mark_deleted(plug, rec)
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "type": type, "id": id, "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_add_master(plugin: str, name: str, size: int = 0) -> Dict[str, Any]:
+    """Append a master (``MAST``+``DATA`` pair) to a TES3 plugin header
+    (idempotent, case-insensitive). Unlike TES4, adds NO FormID fixups — TES3 refs
+    are string ids. Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        masters = tes3_ops.add_master(plug, name, int(size))
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "masters": [{"name": n, "size": s} for n, s in masters],
+            "backup": txn.backup_path}
+
+
+@mcp.tool()
+def tes3_rename_master(plugin: str, old: str, new: str) -> Dict[str, Any]:
+    """Rename a master (``MAST`` filename) ``old`` -> ``new`` in a TES3 header
+    (case-insensitive match). Safety transaction wrapped."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    with _tes3_txn(host, path) as txn:
+        plug = tes3_ops.load(txn.data)
+        masters = tes3_ops.rename_master(plug, old, new)
+        txn.data = tes3_ops.serialize(plug)
+    return {"plugin": path, "masters": [{"name": n, "size": s} for n, s in masters],
+            "backup": txn.backup_path}
+
+
+# --------------------------------------------------------------------------- #
+# Mod installation — OpenMW / Morrowind (:mod:`chim.modinstall`)
+# --------------------------------------------------------------------------- #
+#
+# Generalises the "extract archive -> drop assets in Data Files -> register in
+# openmw.cfg" workflow into one reversible operation. These touch the local
+# filesystem + openmw.cfg, so they require chim running ON the game machine
+# (LocalWindowsHost -- the production deployment), not a RemoteHost. Archives
+# resolve against CHIM_DOWNLOADS (the user's Downloads by default); installs are
+# **dry-run by default**, lock-check OpenMW/OpenMW-CS, back up openmw.cfg, and
+# write a manifest so an install can be cleanly reversed.
+
+
+def _openmw_cfg(host: safety.Host) -> str:
+    o = os.environ.get(ENV_OPENMW_CFG)
+    if o:
+        return o
+    if host.windows:
+        prof = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        return prof + r"\Documents\My Games\OpenMW\openmw.cfg"
+    return os.path.join(os.getcwd(), "openmw.cfg")
+
+
+def _mod_manifest_dir(host: safety.Host) -> str:
+    o = os.environ.get(ENV_MOD_MANIFESTS)
+    if o:
+        return o
+    base = os.path.dirname(_openmw_cfg(host))
+    return (base.rstrip("\\/") + "\\chim_mods") if host.windows else os.path.join(base, "chim_mods")
+
+
+def _downloads_dir(host: safety.Host) -> str:
+    o = os.environ.get(ENV_DOWNLOADS)
+    if o:
+        return o
+    if host.windows:
+        prof = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+        return prof + r"\Downloads"
+    return os.getcwd()
+
+
+def _resolve_in(host: safety.Host, directory: str, name: str) -> str:
+    if name.startswith("/") or name.startswith("\\\\") or (len(name) >= 2 and name[1] == ":"):
+        return name
+    return (directory.rstrip("\\/") + "\\" + name) if host.windows else os.path.join(directory, name)
+
+
+def _skyrim_plugins_txt(host: safety.Host) -> str:
+    o = os.environ.get(ENV_PLUGINS_TXT)
+    if o:
+        return o
+    if host.windows:
+        local = os.environ.get("LOCALAPPDATA") or (os.path.expanduser("~") + r"\AppData\Local")
+        return local.rstrip("\\/") + r"\Skyrim Special Edition\plugins.txt"
+    return os.path.join(os.getcwd(), "plugins.txt")
+
+
+def _game_profile(host: safety.Host, game: str) -> Dict[str, Any]:
+    """Per-game data dir + registration file + lock-process set for mod installs."""
+    g = (game or "openmw").lower()
+    if g == "skyrim":
+        return {"game": "skyrim", "data": _data_dir(host),
+                "cfg": _skyrim_plugins_txt(host), "lock": safety.LOCK_PROCESSES}
+    if g == "openmw":
+        return {"game": "openmw", "data": _mw_data_dir(host),
+                "cfg": _openmw_cfg(host), "lock": safety.OPENMW_LOCK_PROCESSES}
+    raise ValueError(f"unknown game {game!r} (use 'openmw' or 'skyrim')")
+
+
+def _require_local(host: safety.Host) -> None:
+    if isinstance(host, safety.RemoteHost):
+        raise ValueError("mod install needs chim running ON the game machine "
+                         "(LocalWindowsHost); it is not supported over a RemoteHost")
+
+
+def _mod_lock_or_raise(host: safety.Host) -> None:
+    locked = safety.lock_check(host, safety.OPENMW_LOCK_PROCESSES)
+    if locked:
+        raise ValueError(f"cannot modify the install while these run: {locked}. "
+                         "Close OpenMW / OpenMW-CS first.")
+
+
+@mcp.tool()
+def mod_install(archive: str, game: str = "openmw", include: Optional[Sequence[str]] = None,
+                exclude: Optional[Sequence[str]] = None, name: Optional[str] = None,
+                dry_run: bool = True) -> Dict[str, Any]:
+    """Install a mod **archive** (.7z/.zip/.rar) into the game — one installer for
+    both **OpenMW/Morrowind** (``game="openmw"``, default) and **Skyrim SE**
+    (``game="skyrim"``).
+
+    Extracts it, finds the data root (``Data Files`` / ``Data``), copies assets
+    into the game's data dir, and **activates** any plugins: OpenMW registers
+    ``content=`` (+ ``fallback-archive=`` for BSAs) in ``openmw.cfg``; Skyrim adds
+    ``*Plugin.esp`` to ``plugins.txt`` (Skyrim auto-loads a BSA named after an
+    active plugin). Writes a reversible manifest. ``include``/``exclude`` are globs
+    over the data-relative path (e.g. ``include=["Meshes/*","*.esp"]``) to take
+    **only the assets you want**.
+
+    ``archive`` resolves against your Downloads folder (or an absolute path).
+    **``dry_run=True`` by default** reports the plan without changing anything. A
+    real run refuses if the game/editor is running and backs up the config first.
+    Reverse it later with ``mod_uninstall``.
+    """
+    host = _make_host()
+    _require_local(host)
+    prof = _game_profile(host, game)
+    apath = _resolve_in(host, _downloads_dir(host), archive)
+    md = _mod_manifest_dir(host)
+    backup = None
+    if not dry_run:
+        locked = safety.lock_check(host, prof["lock"])
+        if locked:
+            raise ValueError(f"cannot install while these run: {locked}. Close the game/editor first.")
+        if os.path.exists(prof["cfg"]):
+            backup = safety.backup(host, prof["cfg"])
+    rep = modinstall.install_archive(
+        apath, prof["data"], prof["cfg"], md, name=name, game=prof["game"],
+        include=list(include) if include else None,
+        exclude=list(exclude) if exclude else None, dry_run=dry_run)
+    return {"archive": apath, "game": prof["game"], "name": rep["name"],
+            "data_dir": prof["data"], "cfg": prof["cfg"], "plugins": rep["plugins"],
+            "archives": rep["archives"], "new_file_count": rep["new_file_count"],
+            "cfg_added": rep["cfg_added"], "dry_run": dry_run, "cfg_backup": backup}
+
+
+@mcp.tool()
+def mod_extract_bsa(bsa: str, patterns: Optional[Sequence[str]] = None,
+                    names: Optional[Sequence[str]] = None, name: Optional[str] = None,
+                    dry_run: bool = True) -> Dict[str, Any]:
+    """Surgically extract a **subset** of a Morrowind mod's ``.bsa`` as loose files
+    into ``Data Files`` — the "only the assets we use" path.
+
+    ``patterns`` are case-insensitive globs over archived paths (e.g.
+    ``["meshes\\\\em_kids\\\\*", "textures\\\\*corean*"]``); ``names`` is an explicit
+    archived-path list. ``bsa`` resolves against the Morrowind ``Data Files`` (or an
+    absolute path). **``dry_run=True`` by default** reports the match count. Backed
+    by chim's TES3 BSA reader; writes a manifest for ``mod_uninstall``.
+    """
+    host = _make_host()
+    _require_local(host)
+    bpath = _resolve_in(host, _mw_data_dir(host), bsa)
+    data, md = _mw_data_dir(host), _mod_manifest_dir(host)
+    nm = name or (os.path.splitext(os.path.basename(bpath))[0] + "_assets")
+    if not dry_run:
+        _mod_lock_or_raise(host)
+    rep = modinstall.extract_bsa_assets(
+        bpath, data, nm, md,
+        patterns=list(patterns) if patterns else None,
+        names=list(names) if names else None, dry_run=dry_run)
+    return {"bsa": bpath, "name": nm, "data_dir": data, "matched": len(rep["files"]),
+            "new_file_count": rep["new_file_count"], "dry_run": dry_run}
+
+
+@mcp.tool()
+def mod_uninstall(name: str) -> Dict[str, Any]:
+    """Reverse a chim mod install by its manifest ``name``: delete the files it
+    added (never a pre-existing one) and drop the config lines it added. Uses the
+    manifest's game (openmw/skyrim) to lock-check the right processes and back up
+    the right config (``openmw.cfg`` / ``plugins.txt``) first, then removes the
+    manifest."""
+    host = _make_host()
+    _require_local(host)
+    md = _mod_manifest_dir(host)
+    manifest = modinstall.load_manifest(md, name)
+    game = (manifest.get("game") or "openmw").lower()
+    cfg = manifest.get("cfg")
+    lock = safety.LOCK_PROCESSES if game == "skyrim" else safety.OPENMW_LOCK_PROCESSES
+    locked = safety.lock_check(host, lock)
+    if locked:
+        raise ValueError(f"cannot uninstall while these run: {locked}. Close the game/editor first.")
+    backup = safety.backup(host, cfg) if cfg and os.path.exists(cfg) else None
+    res = modinstall.uninstall(manifest, cfg)
+    mp = os.path.join(md, name + ".json")
+    if os.path.exists(mp):
+        os.remove(mp)
+    return {"name": name, "game": game, "cfg": cfg, "cfg_backup": backup, **res}
+
+
+@mcp.tool()
+def mod_list() -> Dict[str, Any]:
+    """List the mods chim has installed (from its manifests), with plugin / BSA /
+    file counts. No mutation."""
+    host = _make_host()
+    md = _mod_manifest_dir(host)
+    out: List[Dict[str, Any]] = []
+    for n in modinstall.list_manifests(md):
+        try:
+            m = modinstall.load_manifest(md, n)
+            out.append({"name": n, "plugins": m.get("plugins", []),
+                        "archives": m.get("archives", []), "files": len(m.get("files", []))})
+        except Exception:  # pragma: no cover - skip a corrupt manifest
+            continue
+    return {"manifest_dir": md, "installed": out}
 
 
 # --------------------------------------------------------------------------- #

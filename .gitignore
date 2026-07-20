@@ -19,3 +19,4 @@ dist/
 # CLAUDE.md stays at repo root so Claude Code still auto-loads it (just untracked).
 CLAUDE.md
 docs/modding/
+docs/private/

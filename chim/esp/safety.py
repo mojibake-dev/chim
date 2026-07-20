@@ -54,7 +54,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Sequence
 
 from .records import walk_clean
 
@@ -76,6 +76,20 @@ LOCK_PROCESSES: tuple[str, ...] = (
     "ckpe_loader",
     "SkyrimSE",
     "SkyrimSELauncher",
+)
+
+#: OpenMW / Morrowind equivalents for chim's TES3 engine. ``openmw-cs`` is the
+#: one that really matters -- never edit a plugin its editor has open. Names are
+#: image names as ``Get-Process`` reports them (no ``.exe``).
+OPENMW_LOCK_PROCESSES: tuple[str, ...] = (
+    "openmw",
+    "openmw-cs",
+    "openmw-launcher",
+)
+
+#: Default Morrowind ``Data Files`` directory (Steam). OpenMW reads content here.
+OPENMW_DEFAULT_DATA_DIR = (
+    r"C:\Program Files (x86)\Steam\steamapps\common\Morrowind\Data Files"
 )
 
 #: Timestamp format used for ``.bak`` file names. Sorts lexicographically.
@@ -407,15 +421,16 @@ def _ps_quote(value: str) -> str:
 # Lock check
 # --------------------------------------------------------------------------- #
 
-def lock_check(host: Host) -> List[str]:
+def lock_check(host: Host, processes: Sequence[str] = LOCK_PROCESSES) -> List[str]:
     """Return the names of any lock-holding processes running on ``host``.
 
-    Queries ``Get-Process`` for each name in :data:`LOCK_PROCESSES`. An empty
-    list means it is safe to edit. This never raises on "nothing running"; it
-    is the caller's (or :func:`transaction`'s) job to decide what an occupied
+    Queries ``Get-Process`` for each name in ``processes`` (default
+    :data:`LOCK_PROCESSES`; the TES3 tools pass :data:`OPENMW_LOCK_PROCESSES`). An
+    empty list means it is safe to edit. This never raises on "nothing running";
+    it is the caller's (or :func:`transaction`'s) job to decide what an occupied
     list means.
     """
-    names = ",".join(f"'{n}'" for n in LOCK_PROCESSES)
+    names = ",".join(f"'{n}'" for n in processes)
     # Filter all processes with Where-Object rather than `Get-Process -Name`:
     # `-Name` emits a non-terminating error AND a non-zero process exit code for
     # every name with no running match, so the all-absent case -- the UNLOCKED
@@ -433,7 +448,7 @@ def lock_check(host: Host) -> List[str]:
     seen = set()
     for line in out.splitlines():
         name = line.strip()
-        if name and name in LOCK_PROCESSES and name not in seen:
+        if name and name in processes and name not in seen:
             seen.add(name)
             running.append(name)
     return running
@@ -504,6 +519,8 @@ def transaction(
     *,
     verify: bool = True,
     timestamp: Optional[str] = None,
+    verify_fn: Callable[[bytes], bool] = walk_clean,
+    lock_processes: Sequence[str] = LOCK_PROCESSES,
 ) -> Iterator[_Txn]:
     """Safely edit the plugin at ``path`` on ``host``.
 
@@ -523,7 +540,7 @@ def transaction(
     If the body raises, no write happens; the backup is left in place so the
     original is always recoverable.
     """
-    locked = lock_check(host)
+    locked = lock_check(host, lock_processes)
     if locked:
         raise LockError(locked)
 
@@ -540,14 +557,14 @@ def transaction(
         return
 
     written = host.read_file(path)
-    if walk_clean(written):
+    if verify_fn(written):
         return
 
     # Dirty result: roll back from the backup and report.
     restored = False
     try:
         host.copy_file(bak_path, path)
-        restored = walk_clean(host.read_file(path))
+        restored = verify_fn(host.read_file(path))
     except Exception:  # pragma: no cover - restore best-effort
         restored = False
     raise TransactionError(path, bak_path, restored)
@@ -556,6 +573,8 @@ def transaction(
 __all__ = [
     "DEFAULT_DATA_DIR",
     "LOCK_PROCESSES",
+    "OPENMW_DEFAULT_DATA_DIR",
+    "OPENMW_LOCK_PROCESSES",
     "BACKUP_TIMESTAMP_FMT",
     "Host",
     "RemoteHost",

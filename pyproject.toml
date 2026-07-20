@@ -32,7 +32,7 @@ dev = [
 chim-mcp = "chim.server:main"
 
 [tool.setuptools]
-packages = ["chim", "chim.esp", "chim.save"]
+packages = ["chim", "chim.esp", "chim.save", "chim.tes3"]
 
 # esplib (the byte engine, since the 2026-07-11 rewrite) is NOT on PyPI, so uv
 # resolves it straight from GitHub. Pinned to a commit for reproducibility — bump
