@@ -36,6 +36,7 @@ console script.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -44,7 +45,7 @@ from mcp.server.fastmcp import FastMCP
 from .esp import ops, papyrus, safety
 from .save import analysis as save_analysis
 from .tes3 import ops as tes3_ops, analysis as tes3_analysis
-from . import modinstall
+from . import modinstall, modlock, assets
 
 
 # --------------------------------------------------------------------------- #
@@ -74,14 +75,16 @@ def _make_host() -> safety.Host:
     * unset, on Windows -> a :class:`LocalWindowsHost`: direct local file I/O
       **plus a real lock-check** (chim runs *on* the remote host -- the intended
       production deployment).
-    * unset, elsewhere -> a :class:`LocalHost` dev/test double (always unlocked).
+    * unset, on macOS / Linux -> a :class:`LocalUnixHost`: direct local file I/O
+      plus an honest ``pgrep`` lock-check (the Mac's TES3MP node -- so a local roll
+      or edit refuses while OpenMW / openmw-cs is running).
     """
     target = os.environ.get(ENV_SSH_HOST)
     if target:
         return safety.RemoteHost(target)
     if os.name == "nt":
         return safety.LocalWindowsHost()
-    return safety.LocalHost()
+    return safety.LocalUnixHost()
 
 
 def _data_dir(host: safety.Host) -> str:
@@ -1694,6 +1697,91 @@ def mod_list() -> Dict[str, Any]:
         except Exception:  # pragma: no cover - skip a corrupt manifest
             continue
     return {"manifest_dir": md, "installed": out}
+
+
+@mcp.tool()
+def mod_export(out_dir: str, bundle_dirs: Optional[Sequence[str]] = None,
+               cfg: Optional[str] = None, server_address: Optional[str] = None,
+               openmw_base: Optional[str] = None, protocol: Optional[int] = None,
+               enforce_checksums: bool = True, zip_name: str = "canon.zip",
+               title: str = "Morrowind Multiplayer") -> Dict[str, Any]:
+    """**Roll** the local OpenMW/TES3MP ``Data Files`` into a frozen, distributable bundle —
+    the multiplayer pipeline's one command.
+
+    From your ``openmw.cfg`` (all four axes) it writes into ``out_dir``:
+
+    * ``modlock.json`` — the portable manifest (engine pin, the ordered ``content`` plugins
+      each sha256+crc32+size+masters, archives/groundcover, and every bundled file hashed);
+    * ``requiredDataFiles.json`` — the TES3MP array the **server** enforces (name + order +
+      CRC32; sibling baar-dau ``modlist_apply`` consumes the modlock to write this too);
+    * the **canon zip** (``zip_name``) — the bundled data dir(s), laid out for a client to
+      drop into its Data Files (reproducible: deterministic order + fixed mtime);
+    * ``INSTALL.md`` — per-OS **wipe-and-unzip** steps + the load order + the zip's sha256.
+
+    ``bundle_dirs`` = the data dirs whose files ship (default: your Morrowind ``Data Files``);
+    the user's vanilla install stays out of the zip but its plugins are still hashed into the
+    manifest so the server enforces them. Commit ``out_dir`` (the git seam) + upload the zip;
+    post the link + ``INSTALL.md`` to Discord. ``openmw_base`` pins the engine (a
+    ``.omwscripts`` in the load order **hard-errors** on TES3MP's ~0.47 base). Local-only
+    (chim must run on the machine holding the canon). Read-only w.r.t. the game; writes only
+    into ``out_dir``.
+    """
+    host = _make_host()
+    _require_local(host)
+    cfg_path = cfg or _openmw_cfg(host)
+    dirs = list(bundle_dirs) if bundle_dirs else [_mw_data_dir(host)]
+    engine = {"fork": "tes3mp", "openmw_base": openmw_base, "protocol": protocol}
+    return modlock.roll(cfg_path, out_dir, bundle_dirs=dirs, engine=engine,
+                        enforce_checksums=enforce_checksums, server_address=server_address,
+                        zip_name=zip_name, title=title)
+
+
+@mcp.tool()
+def mod_resolve(cfg: Optional[str] = None, plugins: Optional[Sequence[str]] = None,
+                data_dirs: Optional[Sequence[str]] = None, out_closure: Optional[str] = None,
+                materialize: Optional[str] = None, include_sounds: bool = True) -> Dict[str, Any]:
+    """Resolve the **used-asset closure** of a modlist — the exact set of files the plugins
+    reference (meshes via ``MODL``, each mesh's NIF textures, item ``ICON``s, ``LTEX`` land
+    textures, ``SOUN`` sounds), and nothing else. The "only the assets we use" cleaner: point
+    it at a dirty ``Data Files`` (a mod manager's accumulated pile) and every orphan, cut-mod
+    leftover, and ``overwrite`` dropping the plugins don't reference is simply left behind.
+
+    Reads ``content=`` + ``data=`` from your ``openmw.cfg`` by default (override with
+    ``plugins`` / ``data_dirs``). ``out_closure`` writes the resolved file list;
+    ``materialize`` copies the closure into a clean dir (a provably-clean ``Data Files``).
+    Returns stats, the ``closure_gb`` size, and ``missing`` (refs that didn't resolve — the
+    gaps to fill from mod archives). Read-only w.r.t. the source; local-only. For a long run
+    over a flaky link, launch ``python -m chim.assets`` detached instead (same engine)."""
+    host = _make_host()
+    _require_local(host)
+    cfgp = cfg or _openmw_cfg(host)
+    r = assets.resolve_modlist(
+        cfg=cfgp, content=list(plugins) if plugins else None,
+        data_dirs=list(data_dirs) if data_dirs else None, include_sounds=include_sounds)
+    dd = list(data_dirs) if data_dirs else loadorder.read_data_dirs(cfgp)
+    if out_closure:
+        with open(out_closure, "w", encoding="utf-8") as f:
+            f.writelines(uf + "\n" for uf in r["used_files"])
+    mat = assets.materialize_closure(r, dd, materialize) if materialize else None
+    return {"plugins_resolved": r["plugins_resolved"], "plugins_missing": r["plugins_missing"],
+            "stats": r["stats"], "closure_gb": r["closure_gb"],
+            "missing": {k: v[:30] for k, v in r["missing"].items()},
+            "closure_written": out_closure, "materialized": mat}
+
+
+@mcp.tool()
+def mod_verify(modlock_path: str, bundle_dirs: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Byte-identity check: re-hash the local ``Data Files`` against a ``modlock.json`` and
+    report ``matched`` / ``mismatched`` / ``missing`` / ``extra``. ``extra`` flags a local
+    addition that would desync TES3MP. ``bundle_dirs`` defaults to your Morrowind ``Data
+    Files``. Read-only — the pre-flight before trusting a roll."""
+    host = _make_host()
+    _require_local(host)
+    mpath = _resolve_in(host, os.getcwd(), modlock_path)
+    with open(mpath, "r", encoding="utf-8") as fh:
+        ml = json.load(fh)
+    dirs = list(bundle_dirs) if bundle_dirs else [_mw_data_dir(host)]
+    return modlock.verify(ml, dirs)
 
 
 # --------------------------------------------------------------------------- #

@@ -132,6 +132,112 @@ def test_install_archive_zip(tmp_path):
     assert "content=MyMod.esp" in open(cfg).read()
 
 
+def test_omwscripts_registered_as_content(tmp_path):
+    # An OpenMW Lua mod ships a .omwscripts (+ a scripts/ dir) and MUST register as
+    # content= -- otherwise it installs *dark* (the batch-install bug: 11 Lua mods
+    # copied their files but never activated).
+    root = str(tmp_path / "luamod"); df = os.path.join(root, "Data Files")
+    os.makedirs(os.path.join(df, "scripts", "mymod"))
+    open(os.path.join(df, "MyLuaMod.omwscripts"), "w").write("LUA = scripts/mymod/main.lua\n")
+    open(os.path.join(df, "scripts", "mymod", "main.lua"), "w").write("return {}")
+    assert M.find_data_root(root) == df
+    plan = M.plan_install(df)
+    assert plan.plugins == ["MyLuaMod.omwscripts"]          # classified as content, not asset
+    data = str(tmp_path / "game"); os.makedirs(data)
+    cfg = str(tmp_path / "openmw.cfg"); open(cfg, "w").write("content=Morrowind.esm\n")
+    md = str(tmp_path / "m")
+    man = M.install(plan, data, cfg, "MyLuaMod", md)
+    assert "content=MyLuaMod.omwscripts" in open(cfg).read()
+    assert os.path.exists(os.path.join(data, "scripts", "mymod", "main.lua"))
+    assert man["cfg_added"] == ["content=MyLuaMod.omwscripts"]
+    M.uninstall(M.load_manifest(md, "MyLuaMod"), cfg)       # reversible
+    assert "content=MyLuaMod.omwscripts" not in open(cfg).read()
+
+
+FOMOD_XML = '''<config>
+  <moduleName>Test Atlas</moduleName>
+  <requiredInstallFiles>
+    <folder source="00 Core" destination=""/>
+  </requiredInstallFiles>
+  <installSteps order="Explicit">
+    <installStep name="Textures">
+      <optionalFileGroups order="Explicit">
+        <group name="Texture Set" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Vanilla">
+              <files><folder source="Tex Vanilla" destination=""/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="Fancy">
+              <files><folder source="Tex Fancy" destination=""/></files>
+              <typeDescriptor><type name="Recommended"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>'''
+
+
+def _make_fomod_tree(root: str) -> str:
+    os.makedirs(os.path.join(root, "00 Core", "meshes"))
+    os.makedirs(os.path.join(root, "Tex Vanilla", "textures"))
+    os.makedirs(os.path.join(root, "Tex Fancy", "textures"))
+    os.makedirs(os.path.join(root, "fomod"))
+    open(os.path.join(root, "00 Core", "Core.esp"), "wb").write(b"TES3")
+    open(os.path.join(root, "00 Core", "meshes", "c.nif"), "wb").write(b"n")
+    open(os.path.join(root, "Tex Vanilla", "textures", "v.dds"), "wb").write(b"V")
+    open(os.path.join(root, "Tex Fancy", "textures", "f.dds"), "wb").write(b"F")
+    open(os.path.join(root, "fomod", "ModuleConfig.xml"), "w").write(FOMOD_XML)
+    return root
+
+
+def test_fomod_parse_and_select(tmp_path):
+    root = _make_fomod_tree(str(tmp_path / "mod"))
+    assert M.find_fomod(str(tmp_path / "mod")) == root
+    cfg = M.parse_fomod(root)
+    assert cfg.module_name == "Test Atlas"
+    assert [f.source for f in cfg.required] == ["00 Core"]
+    assert {o.name for o in cfg.options} == {"Vanilla", "Fancy"}
+    # SelectExactlyOne with no choice -> the Recommended one (Fancy)
+    _, sel = M.fomod_plan(cfg, [])
+    assert sel == ["Fancy"]
+    # explicit choice overrides the group's recommended, exclusively
+    _, sel = M.fomod_plan(cfg, ["Vanilla"])
+    assert sel == ["Vanilla"]
+
+
+def test_install_fomod_selects_one_variant(tmp_path):
+    root = _make_fomod_tree(str(tmp_path / "mod"))
+    data = str(tmp_path / "game"); os.makedirs(data)
+    cfg = str(tmp_path / "openmw.cfg"); open(cfg, "w").write("")
+    md = str(tmp_path / "m")
+    man = M.install_fomod(root, data, cfg, md, name="Atlas", choose=["Vanilla"])
+    assert os.path.exists(os.path.join(data, "Core.esp"))                 # requiredInstallFiles
+    assert os.path.exists(os.path.join(data, "meshes", "c.nif"))
+    assert os.path.exists(os.path.join(data, "textures", "v.dds"))        # chosen variant
+    assert not os.path.exists(os.path.join(data, "textures", "f.dds"))    # other variant excluded
+    assert "content=Core.esp" in open(cfg).read()
+    assert man["fomod_options_selected"] == ["Vanilla"]
+    assert man["fomod_module"] == "Test Atlas"
+    # fully reversible
+    M.uninstall(M.load_manifest(md, "Atlas"), cfg)
+    assert not os.path.exists(os.path.join(data, "Core.esp"))
+    assert "content=Core.esp" not in open(cfg).read()
+
+
+def test_fomod_summary_lists_options(tmp_path):
+    root = _make_fomod_tree(str(tmp_path / "mod"))
+    s = M.fomod_summary(root)
+    assert s["module"] == "Test Atlas"
+    assert s["required"] == ["00 Core"]                    # Core is required, not a listed option
+    names = {o["name"]: o for o in s["options"]}
+    assert set(names) == {"Vanilla", "Fancy"}
+    assert names["Fancy"]["type"] == "Recommended"
+    assert names["Vanilla"]["group_type"] == "SelectExactlyOne"
+
+
 def test_register_skyrim(tmp_path):
     pt = str(tmp_path / "plugins.txt")
     open(pt, "w").write("*Skyrim.esm\n*Update.esm\n")

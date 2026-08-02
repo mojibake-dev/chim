@@ -14,6 +14,10 @@ into one reversible operation, in chim's lock/backup/verify spirit:
   lines (never touching pre-existing files) -- so an install is fully reversible.
 * :func:`extract_bsa_assets` pulls a *subset* of a mod's BSA out as loose files
   (the surgical "only ``de_kids`` meshes" path), backed by :class:`chim.tes3.bsa.Bsa`.
+* :func:`install_fomod` (+ :func:`fomod_summary` to enumerate) installs a **FOMOD**
+  scripted installer -- parses ``fomod/ModuleConfig.xml``, selects options (explicit
+  names or Required/Recommended defaults, group-exclusive), maps each option's
+  ``source`` -> ``destination``, and installs it reversibly like any other.
 
 TES3-only for now (OpenMW's ``openmw.cfg``); the same shape extends to Skyrim's
 ``plugins.txt`` later.
@@ -27,12 +31,17 @@ import os
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from .tes3.bsa import Bsa
 
-PLUGIN_EXTS = (".esp", ".esm", ".esl", ".omwaddon")
+#: Content files registered via ``content=`` / ``plugins.txt``. ``.omwaddon`` and
+#: ``.omwscripts`` are OpenMW-only -- a ``.omwscripts`` is a Lua-script registration
+#: file, but it activates as ``content=`` exactly like a plugin, so it belongs here
+#: (a Lua mod that isn't registered installs *dark*).
+PLUGIN_EXTS = (".esp", ".esm", ".esl", ".omwaddon", ".omwscripts")
 #: Directory names that mark an extracted tree as a game data root (Morrowind + Skyrim).
 ASSET_DIRS = {"meshes", "textures", "icons", "sound", "bookart", "fonts", "splash",
               "music", "video", "mwscripts", "distantland", "shaders",
@@ -289,6 +298,262 @@ def install_archive(archive: str, data_dir: str, cfg_path: str, manifest_dir: st
     plan = plan_install(find_data_root(tmp), include=include, exclude=exclude)
     result = install(plan, data_dir, cfg_path, name, manifest_dir, game=game, dry_run=dry_run)
     result["extracted_to"] = tmp
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# FOMOD (scripted installer) support
+# --------------------------------------------------------------------------- #
+#
+# A FOMOD ships a ``fomod/ModuleConfig.xml`` mapping *options* (grouped into
+# steps) to file sets, plus always-installed ``requiredInstallFiles`` and
+# flag-gated ``conditionalFileInstalls``. chim treats it as a smarter
+# :func:`plan_install`: enumerate options, resolve a selection (explicit names +
+# each group's Required/Recommended defaults, honouring group exclusivity), then
+# install exactly the mapped ``source`` -> ``destination`` files. The *domain*
+# choice (WHICH options -- the variant matching a base retexture, or every patch
+# whose master is installed) stays agent-side; this is the general primitive.
+
+@dataclass
+class FomodFile:
+    source: str        # archive-root-relative path (resolved case-insensitively)
+    destination: str   # Data-Files-relative target ("" == root)
+    is_folder: bool
+
+
+@dataclass
+class FomodOption:
+    name: str
+    step: str
+    group: str
+    group_type: str    # SelectExactlyOne|SelectAny|SelectAll|SelectAtMostOne|SelectAtLeastOne
+    type: str          # Required|Recommended|Optional|NotUsable|CouldBeUsable
+    files: List["FomodFile"] = field(default_factory=list)
+    flags: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class FomodConfig:
+    root: str
+    module_name: str
+    required: List["FomodFile"] = field(default_factory=list)
+    options: List["FomodOption"] = field(default_factory=list)
+    conditional: List = field(default_factory=list)   # [(flags_needed:dict, files:[FomodFile])]
+
+
+def find_fomod(tree: str) -> Optional[str]:
+    """Return the directory CONTAINING a ``fomod/ModuleConfig.xml`` (the root that
+    option ``source`` paths resolve against), or None."""
+    for dirpath, _, files in os.walk(tree):
+        if os.path.basename(dirpath).lower() == "fomod" and \
+                any(f.lower() == "moduleconfig.xml" for f in files):
+            return os.path.dirname(dirpath)
+    return None
+
+
+def _fomod_files(parent) -> List["FomodFile"]:
+    out: List[FomodFile] = []
+    for tag, is_dir in (("folder", True), ("file", False)):
+        for el in parent.findall(tag):
+            src = (el.get("source") or "").strip()
+            dst = el.get("destination")
+            dst = (dst if dst is not None else src).strip()
+            if src:
+                out.append(FomodFile(src, dst, is_dir))
+    return out
+
+
+def parse_fomod(root: str) -> "FomodConfig":
+    """Parse ``<root>/fomod/ModuleConfig.xml`` into a :class:`FomodConfig`."""
+    fdir = next((os.path.join(root, d) for d in os.listdir(root) if d.lower() == "fomod"), None)
+    if not fdir:
+        raise ModInstallError(f"no fomod/ dir under {root!r}")
+    cfgxml = next((os.path.join(fdir, f) for f in os.listdir(fdir) if f.lower() == "moduleconfig.xml"), None)
+    if not cfgxml:
+        raise ModInstallError(f"no ModuleConfig.xml in {fdir!r}")
+    r = ET.parse(cfgxml).getroot()
+    module_name = (r.findtext("moduleName") or "").strip()
+    rif = r.find("requiredInstallFiles")
+    required = _fomod_files(rif) if rif is not None else []
+    options: List[FomodOption] = []
+    steps = r.find("installSteps")
+    for step in (steps.findall("installStep") if steps is not None else []):
+        sname = step.get("name", "")
+        ofg = step.find("optionalFileGroups")
+        for g in (ofg.findall("group") if ofg is not None else []):
+            gname, gtype = g.get("name", ""), g.get("type", "")
+            plugs = g.find("plugins")
+            for p in (plugs.findall("plugin") if plugs is not None else []):
+                fel = p.find("files")
+                files = _fomod_files(fel) if fel is not None else []
+                flags = {}
+                cf = p.find("conditionFlags")
+                for fl in (cf.findall("flag") if cf is not None else []):
+                    flags[fl.get("name", "")] = (fl.text or "").strip()
+                ptype = ""
+                td = p.find("typeDescriptor")
+                if td is not None:
+                    t = td.find("type")
+                    if t is not None:
+                        ptype = t.get("name", "")
+                    else:
+                        dt = td.find("dependencyType")
+                        d = dt.find("defaultType") if dt is not None else None
+                        if d is not None:
+                            ptype = d.get("name", "")
+                options.append(FomodOption(p.get("name", ""), sname, gname, gtype, ptype, files, flags))
+    conditional = []
+    cfi = r.find("conditionalFileInstalls")
+    if cfi is not None:
+        pats = cfi.find("patterns")
+        for pat in (pats.findall("pattern") if pats is not None else []):
+            need = {}
+            deps = pat.find("dependencies")
+            for fd in (deps.findall("flagDependency") if deps is not None else []):
+                need[fd.get("flag", "")] = fd.get("value", "")
+            fel = pat.find("files")
+            conditional.append((need, _fomod_files(fel) if fel is not None else []))
+    return FomodConfig(root, module_name, required, options, conditional)
+
+
+def _fomod_osrel(p: str) -> str:
+    """A FOMOD path (``\\`` or ``/``) -> OS-native relative path ("" if blank)."""
+    parts = [x for x in p.replace("\\", "/").split("/") if x]
+    return os.path.join(*parts) if parts else ""
+
+
+def _resolve_source(root: str, source: str) -> Optional[str]:
+    """Case-insensitively resolve a FOMOD ``source`` against the archive root
+    (authors routinely mis-case source paths)."""
+    cur = root
+    for part in [x for x in source.replace("\\", "/").split("/") if x]:
+        try:
+            entries = os.listdir(cur)
+        except OSError:
+            return None
+        match = next((e for e in entries if e.lower() == part.lower()), None)
+        if match is None:
+            return None
+        cur = os.path.join(cur, match)
+    return cur
+
+
+def select_fomod_options(config: "FomodConfig", chosen: Sequence[str],
+                         include_recommended: bool = True) -> List["FomodOption"]:
+    """Resolve a selection: explicit ``chosen`` names win; otherwise each group's
+    Required (always) + Recommended (if ``include_recommended``) defaults apply,
+    honouring group exclusivity (``SelectExactlyOne``/``SelectAtMostOne`` yield at
+    most one). ``NotUsable`` is never selected."""
+    chosen_l = {c.lower() for c in chosen}
+    groups: "Dict" = {}
+    for o in config.options:
+        groups.setdefault((o.step, o.group, o.group_type), []).append(o)
+    selected: List[FomodOption] = []
+    for (_, _, gtype), opts in groups.items():
+        picks = [o for o in opts if o.name.lower() in chosen_l]
+        if gtype in ("SelectExactlyOne", "SelectAtMostOne"):
+            here = picks[:1]
+            if not here and gtype == "SelectExactlyOne":
+                here = [o for o in opts if o.type == "Recommended"][:1] or opts[:1]
+            if not here and gtype == "SelectAtMostOne" and include_recommended:
+                here = [o for o in opts if o.type == "Recommended"][:1]
+        elif gtype == "SelectAll":
+            here = list(opts)
+        else:  # SelectAny / SelectAtLeastOne
+            here = list(picks)
+            for o in opts:
+                if o not in here and (o.type == "Required"
+                                      or (include_recommended and o.type == "Recommended")):
+                    here.append(o)
+            if gtype == "SelectAtLeastOne" and not here:
+                here = opts[:1]
+        selected += [o for o in here if o.type != "NotUsable"]
+    return selected
+
+
+def fomod_plan(config: "FomodConfig", chosen: Optional[Sequence[str]] = None, *,
+               include_recommended: bool = True):
+    """Build an :class:`InstallPlan` from ``requiredInstallFiles`` + the selected
+    options' files + any ``conditionalFileInstalls`` whose flags the selection sets.
+    Returns ``(plan, selected_option_names)``. Later files override earlier on a path
+    collision (FOMOD "last wins")."""
+    selected = select_fomod_options(config, chosen or [], include_recommended)
+    flags: Dict[str, str] = {}
+    for o in selected:
+        flags.update(o.flags)
+    ffiles = list(config.required)
+    for o in selected:
+        ffiles += o.files
+    for need, files in config.conditional:
+        if all(flags.get(k) == v for k, v in need.items()):
+            ffiles += files
+    items: "Dict[str, PlanItem]" = {}
+    for ff in ffiles:
+        src = _resolve_source(config.root, ff.source)
+        if not src:
+            continue
+        if os.path.isdir(src):
+            base = _fomod_osrel(ff.destination)
+            for dp, _, fs in os.walk(src):
+                for f in fs:
+                    full = os.path.join(dp, f)
+                    rel_in = os.path.relpath(full, src)
+                    rel = os.path.join(base, rel_in) if base else rel_in
+                    items[rel.lower()] = PlanItem(full, rel, _kind(f))
+        elif os.path.isfile(src):
+            rel = _fomod_osrel(ff.destination) if ff.destination.strip() else os.path.basename(src)
+            items[rel.lower()] = PlanItem(src, rel, _kind(os.path.basename(src)))
+    return InstallPlan(config.root, list(items.values())), [o.name for o in selected]
+
+
+def fomod_summary(tree_or_archive: str, tmp_dir: Optional[str] = None,
+                  seven_zip: Optional[str] = None) -> Dict[str, Any]:
+    """Enumerate a FOMOD's options WITHOUT installing (for choosing a selection).
+    Accepts an extracted tree or an archive (extracted to ``tmp_dir``). Each option
+    reports its group/type/flags + any plugin filenames it would install."""
+    tree = tree_or_archive
+    if not os.path.isdir(tree_or_archive):
+        tree = tmp_dir or (tree_or_archive + "_fomod_tmp")
+        extract_archive(tree_or_archive, tree, seven_zip=seven_zip)
+    root = find_fomod(tree)
+    if not root:
+        raise ModInstallError("no fomod/ModuleConfig.xml found")
+    cfg = parse_fomod(root)
+    return {"module": cfg.module_name, "root": root,
+            "required": [f.source for f in cfg.required],
+            "options": [{"name": o.name, "step": o.step, "group": o.group,
+                         "group_type": o.group_type, "type": o.type,
+                         "esps": [os.path.basename(_fomod_osrel(f.source)) for f in o.files
+                                  if f.source.lower().endswith(PLUGIN_EXTS)],
+                         "flags": o.flags} for o in cfg.options]}
+
+
+def install_fomod(tree_or_archive: str, data_dir: str, cfg_path: str, manifest_dir: str,
+                  name: Optional[str] = None, *, choose: Optional[Sequence[str]] = None,
+                  include_recommended: bool = True, game: str = "openmw",
+                  tmp_dir: Optional[str] = None, seven_zip: Optional[str] = None,
+                  dry_run: bool = False) -> Dict[str, Any]:
+    """Install a FOMOD: extract (if an archive) -> parse ``ModuleConfig.xml`` ->
+    select (``choose`` names + Required/Recommended defaults, group-exclusive) ->
+    install the mapped files + register plugins/BSAs + write a manifest (reuses
+    :func:`install`, so it reverses via :func:`uninstall`). Returns the manifest
+    plus ``fomod_module`` / ``fomod_options_selected``."""
+    tree = tree_or_archive
+    if not os.path.isdir(tree_or_archive):
+        name = name or os.path.splitext(os.path.basename(tree_or_archive))[0]
+        tree = tmp_dir or os.path.join(os.path.dirname(os.path.abspath(tree_or_archive)),
+                                       "_chim_fomod_" + name)
+        extract_archive(tree_or_archive, tree, seven_zip=seven_zip)
+    name = name or os.path.basename(tree.rstrip("/\\"))
+    root = find_fomod(tree)
+    if not root:
+        raise ModInstallError("no fomod/ModuleConfig.xml found in the archive")
+    config = parse_fomod(root)
+    plan, selected = fomod_plan(config, choose, include_recommended=include_recommended)
+    result = install(plan, data_dir, cfg_path, name, manifest_dir, game=game, dry_run=dry_run)
+    result["fomod_module"] = config.module_name
+    result["fomod_options_selected"] = selected
+    result["extracted_to"] = tree
     return result
 
 

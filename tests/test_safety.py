@@ -18,9 +18,11 @@ from chim.esp import fields
 from chim.esp.records import iterate, Record
 from chim.esp.safety import (
     LocalHost,
+    LocalUnixHost,
     LockError,
     TransactionError,
     LOCK_PROCESSES,
+    OPENMW_LOCK_PROCESSES,
     backup,
     lock_check,
     transaction,
@@ -40,6 +42,35 @@ def plugin_path(tmp_path) -> str:
 @pytest.fixture
 def host() -> LocalHost:
     return LocalHost()
+
+
+# --------------------------------------------------------------------------- #
+# LocalUnixHost -- the real macOS/Linux lock-check (pgrep)
+# --------------------------------------------------------------------------- #
+
+def test_local_unix_host_lock_check_real_process():
+    """On a POSIX box the lock-check actually observes a running process (via pgrep)."""
+    import subprocess as _sp
+    import sys as _sys
+
+    if _sys.platform == "win32":
+        pytest.skip("LocalUnixHost is for POSIX hosts")
+    host = LocalUnixHost()
+    # nothing from the OpenMW set is running under the test harness
+    assert lock_check(host, OPENMW_LOCK_PROCESSES) == []
+    # a real, known-running process IS detected (spawn a sleep, look for it)
+    proc = _sp.Popen(["sleep", "30"])
+    try:
+        assert "sleep" in host.running_processes(["sleep", "openmw"])
+        assert "openmw" not in host.running_processes(["sleep", "openmw"])
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_local_unix_host_no_powershell():
+    with pytest.raises(NotImplementedError):
+        LocalUnixHost().run_powershell("Get-Process")
 
 
 # --------------------------------------------------------------------------- #

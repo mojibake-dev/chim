@@ -165,6 +165,32 @@ class Host(ABC):
         """Copy ``src`` to ``dst`` on the host (default: read + write)."""
         self.write_file(dst, self.read_file(src))
 
+    def running_processes(self, processes: Sequence[str]) -> List[str]:
+        """Return which of ``processes`` are running on the host (the lock primitive).
+
+        Default: a PowerShell ``Get-Process`` sweep (Windows hosts). POSIX hosts
+        override this with a native query. Filtering with ``Where-Object`` rather
+        than ``Get-Process -Name`` matters: ``-Name`` emits a non-terminating error
+        AND a non-zero exit for every absent name, so the all-absent case -- the
+        UNLOCKED case we most need to succeed -- would read as a failure; the
+        ``Where-Object`` form exits 0 whether or not anything matches.
+        """
+        names = ",".join(f"'{n}'" for n in processes)
+        script = (
+            "$ProgressPreference='SilentlyContinue'; "
+            "Get-Process | Where-Object { @(" + names + ") -contains $_.Name } "
+            "| Select-Object -ExpandProperty ProcessName -Unique"
+        )
+        out = self.run_powershell(script)
+        running: List[str] = []
+        seen = set()
+        for line in out.splitlines():
+            name = line.strip()
+            if name and name in processes and name not in seen:
+                seen.add(name)
+                running.append(name)
+        return running
+
 
 # --------------------------------------------------------------------------- #
 # RemoteHost -- the real target (Windows host over SSH)
@@ -409,6 +435,52 @@ class LocalWindowsHost(LocalHost):
 
 
 # --------------------------------------------------------------------------- #
+# LocalUnixHost -- chim running ON a macOS / Linux game machine
+# --------------------------------------------------------------------------- #
+
+class LocalUnixHost(LocalHost):
+    """A POSIX machine chim runs on (the Mac's TES3MP node, a Linux OpenMW box).
+
+    Inherits :class:`LocalHost`'s direct filesystem I/O but replaces the
+    always-unlocked stub with a **real** lock check via ``pgrep`` (falling back to
+    a ``ps`` sweep), so :func:`transaction` genuinely refuses to edit a plugin while
+    OpenMW / openmw-cs is running -- the honest counterpart to
+    :class:`LocalWindowsHost`, for the non-Windows side of the pipeline. PowerShell
+    is not available here, so :meth:`run_powershell` raises; lock checks go through
+    :meth:`running_processes` instead.
+    """
+
+    windows = False
+
+    def run_powershell(self, script: str) -> str:  # pragma: no cover - not used on POSIX
+        raise NotImplementedError(
+            "PowerShell is unavailable on a POSIX host; lock checks use running_processes()"
+        )
+
+    def running_processes(self, processes: Sequence[str]) -> List[str]:
+        """Which of ``processes`` are running, via ``pgrep -x`` (exact, case-insensitive),
+        with a ``ps`` sweep fallback. Best-effort: if neither tool is present, returns ``[]``
+        (the ``.bak`` / verify layers of :func:`transaction` still guard the edit)."""
+        try:
+            running: List[str] = []
+            for name in processes:
+                proc = subprocess.run(["pgrep", "-x", "-i", name], capture_output=True)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    running.append(name)
+            return running
+        except FileNotFoundError:
+            pass
+        try:
+            out = subprocess.run(
+                ["ps", "-A", "-o", "comm="], capture_output=True, text=True
+            ).stdout
+        except Exception:  # pragma: no cover - no ps either
+            return []
+        live = {os.path.basename(l.strip()).lower() for l in out.splitlines() if l.strip()}
+        return [p for p in processes if p.lower() in live]
+
+
+# --------------------------------------------------------------------------- #
 # PowerShell quoting
 # --------------------------------------------------------------------------- #
 
@@ -424,34 +496,14 @@ def _ps_quote(value: str) -> str:
 def lock_check(host: Host, processes: Sequence[str] = LOCK_PROCESSES) -> List[str]:
     """Return the names of any lock-holding processes running on ``host``.
 
-    Queries ``Get-Process`` for each name in ``processes`` (default
+    Delegates to :meth:`Host.running_processes` (PowerShell on Windows hosts,
+    ``pgrep`` on :class:`LocalUnixHost`), for each name in ``processes`` (default
     :data:`LOCK_PROCESSES`; the TES3 tools pass :data:`OPENMW_LOCK_PROCESSES`). An
     empty list means it is safe to edit. This never raises on "nothing running";
     it is the caller's (or :func:`transaction`'s) job to decide what an occupied
     list means.
     """
-    names = ",".join(f"'{n}'" for n in processes)
-    # Filter all processes with Where-Object rather than `Get-Process -Name`:
-    # `-Name` emits a non-terminating error AND a non-zero process exit code for
-    # every name with no running match, so the all-absent case -- the UNLOCKED
-    # case we most need to succeed -- exits 1 and a strict run_powershell reads it
-    # as a failure (verified live on the remote host). Where-Object never errors on
-    # no match, so the script exits 0 whether or not anything is running. Progress
-    # is silenced so first-run module prep does not spew onto stderr.
-    script = (
-        "$ProgressPreference='SilentlyContinue'; "
-        "Get-Process | Where-Object { @(" + names + ") -contains $_.Name } "
-        "| Select-Object -ExpandProperty ProcessName -Unique"
-    )
-    out = host.run_powershell(script)
-    running: List[str] = []
-    seen = set()
-    for line in out.splitlines():
-        name = line.strip()
-        if name and name in processes and name not in seen:
-            seen.add(name)
-            running.append(name)
-    return running
+    return host.running_processes(processes)
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +632,7 @@ __all__ = [
     "RemoteHost",
     "LocalHost",
     "LocalWindowsHost",
+    "LocalUnixHost",
     "LockError",
     "TransactionError",
     "lock_check",
