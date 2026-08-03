@@ -38,6 +38,10 @@ from . import loadorder
 
 MODLOCK_VERSION = 1
 _PLUGIN_EXTS = (".esp", ".esm", ".omwaddon", ".omwscripts")
+# The incremental-update client scripts, shipped in every canon zip so a cold-installed friend
+# already has the update tool. Repo-relative to this module (the operator rolls from the editable
+# checkout, where chim/clients/ sits beside the package).
+_CLIENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "clients")
 
 # TES3MP accepts *any* CRC in a plugin's list, so the vanilla masters carry every known-good
 # edition CRC -- an English or Russian copy must both pass, since friends supply their OWN
@@ -556,6 +560,16 @@ def roll(cfg_path: str, out_dir: str, *, bundle_dirs: Sequence[str],
     extra = {"openmw.cfg": openmw_cfg, "INSTALL.md": install_md}
     if client_default:
         extra["tes3mp-client-default.cfg"] = client_default
+    # Ship the incremental-update clients IN the zip (and as out_dir siblings, which is how they
+    # reach the server for standalone download): a cold-installed friend then already has the
+    # update tool, and each run self-verifies files against this same modlock.json. They sit on
+    # the sync's own IGNORE list so a sync never deletes them.
+    for _name in ("canon-sync.ps1", "canon-sync.sh"):
+        _p = os.path.join(_CLIENTS_DIR, _name)
+        if not os.path.isfile(_p):
+            raise ModlockError("sync client missing: %s (the canon zip must ship it)" % _p)
+        with open(_p, "r", encoding="utf-8") as _fh:
+            extra[_name] = _fh.read()
 
     zip_path = os.path.join(out_dir, zip_name)
     zip_rep = write_bundle_zip(bundle_dirs, zip_path, extra_files=extra)

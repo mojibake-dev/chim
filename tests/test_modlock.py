@@ -252,7 +252,22 @@ def test_roll_pre_rolls_config_into_zip(tmp_path):
     # siblings are byte-identical to the in-zip copies; the roll reports what it bundled
     assert open(rep["client_cfg"]).read() == cfg_in_zip
     assert open(rep["client_default_cfg"]).read() == tcd_in_zip
-    assert rep["bundled"] == ["INSTALL.md", "openmw.cfg", "tes3mp-client-default.cfg"]
+    assert rep["bundled"] == ["INSTALL.md", "canon-sync.ps1", "canon-sync.sh", "openmw.cfg", "tes3mp-client-default.cfg"]
+
+
+def test_roll_ships_sync_clients(tmp_path):
+    # Cold install ships the incremental-update scripts IN the zip (and as out_dir siblings, which
+    # is how they reach the server for standalone download), byte-identical to chim/clients/, so a
+    # friend already has the update tool the moment they unzip.
+    cfg, vanilla, canon = _setup(tmp_path)
+    out = str(tmp_path / "seam")
+    rep = ML.roll(cfg, out, bundle_dirs=[canon], server_address="mw.example.net:25565")
+    with zipfile.ZipFile(rep["zip"]["zip"]) as zf:
+        for name in ("canon-sync.ps1", "canon-sync.sh"):
+            src = open(os.path.join(ML._CLIENTS_DIR, name)).read()
+            assert zf.read(name).decode() == src                 # byte-identical in the zip
+            assert open(os.path.join(out, name)).read() == src   # and as an out_dir sibling
+            assert name in rep["bundled"]
 
 
 def test_render_client_default_cfg():
