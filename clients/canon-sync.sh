@@ -12,6 +12,7 @@ set -eu
 BASE="${BASE:-https://canon.gaussing.tv/049b7997d13572010d849e8b}"   # the vvardenfell canon endpoint
 CANON="${CANON:-$HOME/Games/MW-Canon}"
 MANIFEST_SHA="${MANIFEST_SHA:-}"
+CFG="${CFG:-}"   # the ACTIVE openmw.cfg to sync the load order into (default: this OS's OpenMW config path)
 # files the sync never downloads or deletes (per-friend configs + docs)
 IGNORE=" openmw.cfg INSTALL.md tes3mp-client-default.cfg modlock.json requiredDataFiles.json canon-sync.ps1 canon-sync.sh "
 
@@ -62,6 +63,56 @@ while IFS= read -r stray; do
   case "$IGNORE" in *" $base "*) continue ;; esac
   rm -f "$CANON/$stray"; del=$((del+1))
 done < "$work/strays"
+
+# 4. sync the LOAD ORDER into the friend's ACTIVE openmw.cfg -- the axes TES3MP enforces
+#    (content / fallback-archive / groundcover). Rewrite ONLY those three axes from the manifest,
+#    keep every other line (their data= dirs, fallback= weather/lighting, [General], comments)
+#    verbatim. openmw.cfg stays in IGNORE for the file sync above; here we write it at its real
+#    OpenMW config-dir path, a different location from the canon tree, so there is no conflict.
+if [ -z "$CFG" ]; then                     # locate the ACTIVE openmw.cfg for this OS (override: CFG=)
+  case "$(uname -s)" in
+    Darwin)  CFG="$HOME/Library/Preferences/openmw/openmw.cfg" ;;
+    Linux)   CFG="${XDG_CONFIG_HOME:-$HOME/.config}/openmw/openmw.cfg" ;;
+    *)       CFG="$HOME/Documents/My Games/OpenMW/openmw.cfg" ;;   # Windows via MSYS/Cygwin/Git-Bash
+  esac
+fi
+mkdir -p "$(dirname "$CFG")"
+# cold client: no cfg yet -> seed from the canon's shipped openmw.cfg (per-OS data= lines commented;
+# uncomment your pair once, per INSTALL.md), then merge the axes into it.
+if [ ! -f "$CFG" ]; then
+  if [ -f "$CANON/openmw.cfg" ]; then cp "$CANON/openmw.cfg" "$CFG"
+  else curl -fsSL --retry 5 --retry-delay 2 -o "$CFG" "$BASE/openmw.cfg" || : ; fi
+  echo "seeded a fresh openmw.cfg at $CFG (uncomment your OS's data= lines -- see INSTALL.md)"
+fi
+# the three axis blocks, one value per line, in manifest order (names are quote-free -> emit bare).
+jq -r '.content[].name' "$work/modlock.json" > "$work/ax.content"
+jq -r '.archives[]'     "$work/modlock.json" > "$work/ax.fallback-archive"
+jq -r '.groundcover[]'  "$work/modlock.json" > "$work/ax.groundcover"
+# single-pass rewrite: replace each axis block at its FIRST line's position, drop later lines of
+# that axis, append any axis absent originally (canonical order), keep all else verbatim.
+: > "$work/cfg.new"
+d_content=0; d_fa=0; d_gc=0
+while IFS= read -r line || [ -n "$line" ]; do
+  key=""
+  case "$line" in *=*) key="$(printf '%s' "${line%%=*}" | tr -d '[:space:]' | tr 'A-Z' 'a-z')" ;; esac
+  case "$key" in
+    content)          [ "$d_content" = 0 ] && { sed 's/^/content=/'          "$work/ax.content"          >> "$work/cfg.new"; d_content=1; }; continue ;;
+    fallback-archive) [ "$d_fa"      = 0 ] && { sed 's/^/fallback-archive=/' "$work/ax.fallback-archive" >> "$work/cfg.new"; d_fa=1;      }; continue ;;
+    groundcover)      [ "$d_gc"      = 0 ] && { sed 's/^/groundcover=/'      "$work/ax.groundcover"      >> "$work/cfg.new"; d_gc=1;      }; continue ;;
+  esac
+  printf '%s\n' "$line" >> "$work/cfg.new"
+done < "$CFG"
+[ "$d_content" = 0 ] && sed 's/^/content=/'          "$work/ax.content"          >> "$work/cfg.new"
+[ "$d_fa"      = 0 ] && sed 's/^/fallback-archive=/' "$work/ax.fallback-archive" >> "$work/cfg.new"
+[ "$d_gc"      = 0 ] && sed 's/^/groundcover=/'      "$work/ax.groundcover"      >> "$work/cfg.new"
+n_content=$(wc -l < "$work/ax.content" | tr -d ' ')
+if cmp -s "$work/cfg.new" "$CFG"; then
+  echo "load order already in sync ($n_content plugins)."
+else
+  cp "$CFG" "$CFG.$(date +%Y%m%d-%H%M%S).bak"
+  mv -f "$work/cfg.new" "$CFG"
+  echo "load order synced -> $CFG ($n_content content plugins; backup written)."
+fi
 
 echo "sync: $ok up-to-date, $dl downloaded, $del removed"
 [ "$fail" -eq 0 ] || { echo "canon-sync: $fail file(s) FAILED" >&2; exit 1; }
