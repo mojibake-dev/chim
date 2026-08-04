@@ -121,6 +121,32 @@ def test_rejects_non_tes3_first_record():
         parse_plugin(bad)
 
 
+def test_new_plugin_bootstrap_and_populate():
+    # The one primitive that starts from nothing (every mutating op needs an existing
+    # file): bootstrap an empty patch esp, add a master + a record, round-trip clean.
+    plug = ops.new_plugin(version=1.3, author="chim", description="test patch",
+                          masters=[("Morrowind.esm", 79837557)])
+    assert plug.header.type == "TES3"
+    assert ops.masters(plug) == [("Morrowind.esm", 79837557)]
+    assert ops.num_records_stored(plug) == 0
+    ops.add_record(plug, ops.build_record("CLAS", [("NAME", b"Test\x00"), ("FNAM", b"Test\x00")]))
+    data = ops.serialize(plug)
+    assert ops.walk_clean(data)                          # re-serialises to itself
+    re = ops.load(data)
+    assert ops.num_records_stored(re) == 1
+    assert ops.find_record(re, "CLAS", "Test") is not None
+    assert ops.masters(re) == [("Morrowind.esm", 79837557)]
+
+
+def test_new_plugin_esm_flag_and_empty_is_clean():
+    plug = ops.new_plugin(is_master=True)
+    hedr = plug.header.get("HEDR").data
+    assert len(hedr) == container.HEDR_SIZE
+    assert struct.unpack_from("<I", hedr, 4)[0] == 1     # fileType 1 = esm
+    assert ops.masters(plug) == []
+    assert ops.walk_clean(ops.serialize(plug))           # empty plugin still parses clean
+
+
 # --------------------------------------------------------------------------- #
 # Real plugin (ground truth) -- skipped when the scratch file is absent
 # --------------------------------------------------------------------------- #

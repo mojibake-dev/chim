@@ -54,6 +54,32 @@ def walk_clean(data: bytes) -> bool:
     return plug.to_bytes() == data
 
 
+def new_plugin(*, version: float = 1.3, is_master: bool = False,
+               author: str = "", description: str = "",
+               masters: Sequence[Tuple[str, int]] = ()) -> Plugin:
+    """Bootstrap a NEW empty TES3 plugin: a ``TES3`` header record (a 300-byte HEDR
+    + optional ``MAST``/``DATA`` master pairs) and no content records.
+
+    Every mutating op requires an existing parsed file; this is the one primitive
+    that starts from nothing (e.g. to author a small patch ``.esp``). Populate it
+    with :func:`add_record` / :func:`add_master`, then :func:`serialize`. ``version``
+    is Morrowind's 1.3; ``is_master`` sets the ESM fileType. ``masters`` are
+    ``(filename, size)`` pairs written as ``MAST``+``DATA`` in header order.
+    """
+    hedr = (struct.pack("<f", version)
+            + struct.pack("<I", 1 if is_master else 0)
+            + author.encode("cp1252")[:32].ljust(32, b"\x00")
+            + description.encode("cp1252")[:256].ljust(256, b"\x00")
+            + struct.pack("<I", 0))  # numRecords -- recomputed by add_record
+    if len(hedr) != container.HEDR_SIZE:
+        raise OpsError("composed HEDR is %d bytes, expected %d" % (len(hedr), container.HEDR_SIZE))
+    subs = [Subrecord("HEDR", hedr)]
+    for name, size in masters:
+        subs.append(Subrecord("MAST", name.encode("cp1252") + b"\x00"))
+        subs.append(Subrecord("DATA", struct.pack("<Q", int(size) & 0xFFFFFFFFFFFFFFFF)))
+    return Plugin(raw=b"", header=Record("TES3", 0, 0, subs), records=[])
+
+
 # --------------------------------------------------------------------------- #
 # Addressing (string editor-ids, no FormID)
 # --------------------------------------------------------------------------- #

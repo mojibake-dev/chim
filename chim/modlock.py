@@ -93,11 +93,29 @@ def _resolve_across(name: str, data_dirs: Sequence[str]) -> Optional[str]:
     return None
 
 
+#: Editor/OS backup + scratch files that must never enter a roll: a safety-transaction ``.bak``
+#: left next to an edited ``.esp``, an OS sidecar, a half-finished ``.part`` download. Filtered at
+#: the shared walk so build_modlock / write_bundle_zip / verify all agree the canon excludes them
+#: (else a ``.bak`` leaks into the modlock + zip on every roll after a plugin edit).
+_CRUFT_SUFFIXES = (".bak", ".tmp", ".temp", ".part", ".orig", ".swp", ".swo", "~")
+_CRUFT_NAMES = frozenset({".ds_store", "thumbs.db", "desktop.ini"})
+
+
+def _is_cruft(name: str) -> bool:
+    low = name.lower()
+    return low in _CRUFT_NAMES or low.endswith(_CRUFT_SUFFIXES)
+
+
 def _walk_files(root: str):
-    """Yield ``(relpath_posix, abspath)`` for every file under ``root`` (sorted, stable)."""
+    """Yield ``(relpath_posix, abspath)`` for every NON-CRUFT file under ``root`` (sorted, stable).
+
+    Backup/scratch files (see :data:`_CRUFT_SUFFIXES`) are skipped so they never leak into the
+    modlock, the zip, or a verify."""
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for f in sorted(filenames):
+            if _is_cruft(f):
+                continue
             ap = os.path.join(dirpath, f)
             rel = os.path.relpath(ap, root).replace(os.sep, "/")
             yield rel, ap
@@ -148,17 +166,22 @@ def build_modlock(cfg_path: str, *, bundle_dirs: Sequence[str],
             "masters": loadorder.plugin_masters(os.path.dirname(p), name),
         })
 
-    # bundled files: everything under bundle_dirs, merged (later dir wins on path collision).
-    merged: Dict[str, str] = {}
+    # bundled files: everything under bundle_dirs, merged CASE-INSENSITIVELY (later dir wins). The
+    # target Data Files is case-insensitive (Windows/macOS/OpenMW VFS), so two dirs supplying the
+    # same asset at case-differing paths are the SAME file. Keying on exact case kept both and
+    # over-counted the manifest with phantom duplicates a client sync would 404 chasing -- this
+    # mirrors write_bundle_zip's merge so modlock.files[] matches the shipped zip exactly.
+    merged: Dict[str, Tuple[str, str]] = {}  # casefold(rel) -> (rel-as-written, abspath)
     for d in bundle_dirs:
         if not os.path.isdir(d):
             raise ModlockError(f"bundle dir does not exist: {d!r}")
         for rel, ap in _walk_files(d):
-            merged[rel] = ap
+            merged[rel.lower()] = (rel, ap)
     files: List[Dict] = []
     total = 0
-    for rel in sorted(merged):
-        sha, crc, size = hash_file(merged[rel])
+    for key in sorted(merged):
+        rel, ap = merged[key]
+        sha, crc, size = hash_file(ap)
         files.append({"path": rel, "sha256": sha, "crc32": crc_hex(crc), "size": size})
         total += size
 
@@ -609,21 +632,23 @@ def verify(modlock: Dict, bundle_dirs: Sequence[str]) -> Dict:
     Returns ``{ok, matched, mismatched, missing, extra}``: ``mismatched`` files differ in
     bytes, ``missing`` are in the modlock but absent on disk, ``extra`` are on disk but not in
     the modlock (a local addition that would break byte-identity). Read-only."""
-    want = {f["path"]: f for f in modlock.get("files", [])}
-    have: Dict[str, str] = {}
+    # Compare CASE-INSENSITIVELY, matching build_modlock/write_bundle_zip's merge and the target's
+    # case-insensitive FS: a bundle file at a case-variant of a modlock path is the SAME file.
+    want = {f["path"].lower(): f for f in modlock.get("files", [])}   # casefold(path) -> meta
+    have: Dict[str, Tuple[str, str]] = {}                             # casefold(rel) -> (rel, abspath)
     for d in bundle_dirs:
         for rel, ap in _walk_files(d):
-            have[rel] = ap  # later dir wins, matching the bundle merge
+            have[rel.lower()] = (rel, ap)  # later dir wins, matching the bundle merge
     matched: List[str] = []
     mismatched: List[str] = []
-    for rel, meta in want.items():
-        ap = have.get(rel)
-        if ap is None:
+    for key, meta in want.items():
+        hv = have.get(key)
+        if hv is None:
             continue
-        sha, _crc, _size = hash_file(ap)
-        (matched if sha == meta["sha256"] else mismatched).append(rel)
-    missing = sorted(set(want) - set(have))
-    extra = sorted(set(have) - set(want))
+        sha, _crc, _size = hash_file(hv[1])
+        (matched if sha == meta["sha256"] else mismatched).append(meta["path"])
+    missing = sorted(meta["path"] for key, meta in want.items() if key not in have)
+    extra = sorted(rel for key, (rel, ap) in have.items() if key not in want)
     return {
         "ok": not mismatched and not missing and not extra,
         "matched": len(matched),
@@ -633,9 +658,60 @@ def verify(modlock: Dict, bundle_dirs: Sequence[str]) -> Dict:
     }
 
 
+def main(argv=None):
+    """``chim-roll``: roll a canon from a declarative ``canon.toml``, the config-driven
+    replacement for the bespoke ``.scratch/*_roll.py`` drivers (the load-order source, bundle
+    dirs, engine, and the expected plugin count all live in ONE file, not the same magic number
+    drifting across N scripts). Reads the toml, calls :func:`roll`, prints the report.
+
+    ``-c/--config`` selects the toml (default ``./canon.toml``); ``-o/--out`` overrides ``out_dir``;
+    ``--check`` validates + prints the resolved kwargs WITHOUT rolling (a fast dry run)."""
+    import argparse
+    import time
+    import tomllib
+
+    ap = argparse.ArgumentParser("chim-roll", description="roll a TES3MP canon from canon.toml")
+    ap.add_argument("-c", "--config", default="canon.toml", help="path to canon.toml (default ./canon.toml)")
+    ap.add_argument("-o", "--out", help="override out_dir")
+    ap.add_argument("--check", action="store_true", help="validate + print kwargs, do not roll")
+    args = ap.parse_args(argv)
+
+    with open(args.config, "rb") as fh:
+        conf = tomllib.load(fh)
+    exp = os.path.expanduser
+    cfg_path = exp(conf["cfg"])
+    out_dir = exp(args.out or conf["out_dir"])
+    kwargs = dict(
+        bundle_dirs=[exp(b) for b in conf["bundle_dirs"]],
+        engine=conf.get("engine"),
+        enforce_checksums=conf.get("enforce_checksums", True),
+        zip_name=conf.get("zip_name", "canon.zip"),
+        server_address=conf.get("server_address"),
+        title=conf.get("title", "Morrowind Multiplayer"),
+        expect_plugins=conf.get("expect_plugins"),
+        forbid_substrings=conf.get("forbid", ()),
+    )
+    if conf.get("password"):
+        kwargs["password"] = conf["password"]
+    if args.check:
+        print(json.dumps({"cfg": cfg_path, "out_dir": out_dir, **kwargs}, indent=2, default=str))
+        return 0
+
+    t = time.time()
+    rep = roll(cfg_path, out_dir, **kwargs)
+    rep = {k: v for k, v in rep.items() if k != "plugins"}
+    rep["roll_seconds"] = round(time.time() - t)
+    print(json.dumps(rep, indent=2, default=str))
+    return 0
+
+
 __all__ = [
     "ModlockError", "hash_file", "crc_hex", "build_modlock", "required_data_files",
     "assert_roll_sane", "verify_zip_crc", "write_bundle_zip", "render_install_md",
     "render_client_cfg", "render_client_default_cfg", "render_deploy_ps1", "roll",
-    "verify", "MODLOCK_VERSION", "VANILLA_CRCS",
+    "verify", "main", "MODLOCK_VERSION", "VANILLA_CRCS",
 ]
+
+
+if __name__ == "__main__":  # python -m chim.modlock
+    raise SystemExit(main())

@@ -30,6 +30,7 @@ dev = [
 
 [project.scripts]
 chim-mcp = "chim.server:main"
+chim-roll = "chim.modlock:main"
 
 [tool.setuptools]
 packages = ["chim", "chim.esp", "chim.save", "chim.tes3"]

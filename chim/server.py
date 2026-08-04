@@ -1481,6 +1481,36 @@ def tes3_rename_master(plugin: str, old: str, new: str) -> Dict[str, Any]:
             "backup": txn.backup_path}
 
 
+@mcp.tool()
+def tes3_new_plugin(plugin: str, author: str = "", description: str = "",
+                    is_master: bool = False, masters: Optional[List[List]] = None,
+                    version: float = 1.3) -> Dict[str, Any]:
+    """Bootstrap a NEW empty TES3 plugin FILE: a ``TES3`` header (300-byte HEDR + optional
+    ``MAST``/``DATA`` master pairs) and no content records. The one primitive that starts from
+    nothing — every other tes3 tool needs an existing file — so it's the entry point for
+    authoring a patch ``.esp`` (e.g. CanonFixes.esp). Populate it afterwards with
+    ``tes3_add_record`` / ``tes3_add_master``. ``masters`` is a list of ``[filename, size]``
+    (``size`` = the master file's byte length, used by the engine's load-consistency check).
+    Refuses to clobber an existing file and lock-checks (CK/OpenMW closed) before writing;
+    self-verifies the composed bytes with ``walk_clean``."""
+    host = _make_host()
+    path = _resolve_tes3(host, plugin)
+    if host.exists(path):
+        raise ValueError(f"{path} already exists; refusing to clobber (delete it first)")
+    running = safety.lock_check(host, safety.OPENMW_LOCK_PROCESSES)
+    if running:
+        raise RuntimeError(f"refusing to write while these are running: {running}")
+    ms = [(str(m[0]), int(m[1])) for m in (masters or [])]
+    plug = tes3_ops.new_plugin(version=float(version), is_master=bool(is_master),
+                               author=author, description=description, masters=ms)
+    data = tes3_ops.serialize(plug)
+    if not tes3_ops.walk_clean(data):
+        raise RuntimeError("composed plugin failed walk_clean self-check")
+    host.write_file(path, data)
+    return {"plugin": path, "is_master": bool(is_master), "bytes": len(data),
+            "masters": [{"name": n, "size": s} for n, s in ms]}
+
+
 # --------------------------------------------------------------------------- #
 # Mod installation — OpenMW / Morrowind (:mod:`chim.modinstall`)
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,37 @@
+# canon.toml -- the declarative definition of the Vvardenfell multiplayer canon.
+#
+# `chim-roll` reads this and calls chim.modlock.roll(). It is the config-driven
+# replacement for the bespoke .scratch/*_roll.py drivers: the load-order source, the
+# bundle dirs, the engine, and (critically) the expected plugin count all live in ONE
+# place, so a canon change is a one-line edit here, not the same magic number drifting
+# across three hand-maintained scripts.
+#
+#   chim-roll                 # roll using ./canon.toml
+#   chim-roll --check         # validate + print resolved kwargs, do not roll
+#   chim-roll -c other.toml   # roll a different canon
+
+cfg     = "~/Library/Preferences/openmw/openmw.cfg"   # the load order (its four axes)
+out_dir = "~/Games/canon-roll"                         # the git seam + upload dir
+
+bundle_dirs = [                                        # where the loose assets live
+    "~/Games/TES3MP-canon",
+    "~/Games/TES3MP-IT",
+    "~/Games/TES3MP-MoreHeads",
+    "~/Games/TES3MP-FF",
+    "~/Games/TES3MP-shaders",
+]
+
+enforce_checksums = true
+expect_plugins    = 154                                # THE single source of truth for the count
+zip_name          = "morrowind-canon.zip"
+server_address    = "vvardenfell.gaussing.tv:25565"
+title             = "Vvardenfell Multiplayer -- Concept-Art Canon"
+
+# cut-list guard: the roll refuses if any content plugin name contains these
+forbid = ["Better Robes", "Better Clothes", "Khajiit-", "New Argonian Bodies",
+          "New Khajiit Bodies", "MacKom", "Better Heads", "Better Bodies"]
+
+[engine]
+fork        = "tes3mp"
+openmw_base = "0.47"
+protocol    = 10

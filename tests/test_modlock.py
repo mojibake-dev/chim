@@ -53,6 +53,19 @@ def test_build_modlock_hashes_all_content_bundles_only_canon(tmp_path):
     assert ml["stats"]["plugins"] == 2 and ml["stats"]["file_count"] == 2
 
 
+def test_walk_excludes_cruft(tmp_path):
+    """Backup/scratch files (a safety-transaction .bak, an OS .DS_Store, a half-done .part) must
+    never enter a roll, else they leak into the modlock + zip on every roll after a plugin edit."""
+    cfg, vanilla, canon = _setup(tmp_path)
+    (tmp_path / "canon" / "Canon.esp.20260803-120000.bak").write_bytes(b"safety backup")
+    (tmp_path / "canon" / ".DS_Store").write_bytes(b"os junk")
+    (tmp_path / "canon" / "meshes" / "x.nif.part").write_bytes(b"half download")
+    ml = ML.build_modlock(cfg, bundle_dirs=[canon])
+    paths = [f["path"] for f in ml["files"]]
+    assert paths == ["Canon.esp", "meshes/x.nif"]  # real files only, cruft dropped
+    assert not any(p.lower().endswith((".bak", ".part")) or ".ds_store" in p.lower() for p in paths)
+
+
 def test_build_modlock_missing_plugin_raises(tmp_path):
     cfg, vanilla, canon = _setup(tmp_path)
     os.remove(os.path.join(vanilla, "Morrowind.esm"))
@@ -157,6 +170,26 @@ def test_write_bundle_zip_case_insensitive_merge(tmp_path):
         entry = next(n for n in names if n.lower() == "meshes/b/head.nif")
         assert zf.read(entry) == b"NEW-familiar-faces"                     # later dir wins
     assert rep["file_count"] == 1
+
+
+def test_build_modlock_case_insensitive_merge(tmp_path):
+    # The manifest counterpart of the zip merge test: two bundle dirs supply the same mesh at
+    # case-differing paths (base `meshes/b/Head.NIF` vs Familiar Faces `Meshes/b/Head.nif`). On a
+    # case-insensitive Data Files that's ONE file, so build_modlock must dedupe case-insensitively
+    # (later dir wins) -- else modlock.files[] over-counts vs the shipped zip and a client sync 404s
+    # chasing a path that isn't on disk.
+    import hashlib
+    cfg, vanilla, canon = _setup(tmp_path)
+    d0 = tmp_path / "base"; d1 = tmp_path / "ff"
+    (d0 / "meshes" / "b").mkdir(parents=True); (d1 / "Meshes" / "b").mkdir(parents=True)
+    (d0 / "meshes" / "b" / "Head.NIF").write_bytes(b"OLD-cut")
+    (d1 / "Meshes" / "b" / "Head.nif").write_bytes(b"NEW-ff")
+    ml = ML.build_modlock(cfg, bundle_dirs=[str(d0), str(d1)], data_dirs=[vanilla, canon])
+    heads = [f for f in ml["files"] if f["path"].lower() == "meshes/b/head.nif"]
+    assert len(heads) == 1                              # deduped, not two case-variants
+    assert heads[0]["path"] == "Meshes/b/Head.nif"      # later dir's case wins (matches the zip)
+    assert heads[0]["sha256"] == hashlib.sha256(b"NEW-ff").hexdigest()  # later dir's bytes win
+    assert ml["stats"]["file_count"] == 1
 
 
 def test_roll_produces_all_artifacts_and_verifies(tmp_path):
@@ -294,3 +327,40 @@ def test_render_client_cfg_data_options(tmp_path):
     assert '#data="C:/MW/Data Files"' in lines and "#data=C:/Canon" in lines  # space -> quoted
     assert not any(l.startswith("data=") for l in lines)  # per-OS commented, none active
     assert "content=Morrowind.esm" in lines and "content=Canon.esp" in lines  # load order still active
+
+
+def test_chim_roll_cli_rolls_from_toml(tmp_path, capsys):
+    """`chim-roll` (ML.main) rolls end-to-end from a declarative canon.toml: the dogfooded
+    replacement for the bespoke .scratch roll drivers."""
+    cfg, vanilla, canon = _setup(tmp_path)
+    out = tmp_path / "out"
+    toml = tmp_path / "canon.toml"
+    toml.write_text(
+        f'cfg = "{cfg}"\n'
+        f'out_dir = "{out}"\n'
+        f'bundle_dirs = ["{canon}"]\n'
+        "enforce_checksums = true\n"
+        "expect_plugins = 2\n"
+        'zip_name = "test-canon.zip"\n'
+        'title = "Test Canon"\n',
+        encoding="utf-8",
+    )
+    assert ML.main(["-c", str(toml)]) == 0
+    for artifact in ("modlock.json", "requiredDataFiles.json", "test-canon.zip", "INSTALL.md"):
+        assert (out / artifact).exists(), artifact
+    assert json.loads((out / "modlock.json").read_text())["stats"]["plugins"] == 2
+    rep = json.loads(capsys.readouterr().out)   # report printed, with roll_seconds
+    assert rep["stats"]["plugins"] == 2 and "roll_seconds" in rep
+
+
+def test_chim_roll_cli_check_does_not_roll(tmp_path, capsys):
+    """--check validates the toml + prints resolved kwargs, writing nothing."""
+    cfg, vanilla, canon = _setup(tmp_path)
+    out = tmp_path / "out"
+    toml = tmp_path / "canon.toml"
+    toml.write_text(f'cfg = "{cfg}"\nout_dir = "{out}"\nbundle_dirs = ["{canon}"]\nexpect_plugins = 2\n',
+                    encoding="utf-8")
+    assert ML.main(["-c", str(toml), "--check"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["expect_plugins"] == 2 and printed["bundle_dirs"] == [str(canon)]
+    assert not out.exists()   # --check rolls nothing
