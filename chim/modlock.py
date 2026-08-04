@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import zipfile
 import zlib
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -381,11 +382,11 @@ AND writes the load order into your OpenMW config. Run it once to install, re-ru
 
 ## 1. Run the sync script
 
-Keep this unzipped folder somewhere permanent; it's your **canon dir**. Then run the script against
-it (its download URL is baked in; the manifest sha is in your invite):
+Keep this unzipped folder somewhere permanent; it's your **canon dir**. Then run the sync script
+**from inside it** (it syncs its own folder, no path needed; the manifest sha is in your invite):
 
-- **Windows:** `powershell -ExecutionPolicy Bypass -File canon-sync.ps1 -Canon "<this folder>" -ManifestSha <sha>`
-- **macOS/Linux:** `CANON="<this folder>" MANIFEST_SHA=<sha> ./canon-sync.sh`
+- **Windows:** `powershell -ExecutionPolicy Bypass -File canon-sync.ps1 -ManifestSha <sha>`
+- **macOS/Linux:** `MANIFEST_SHA=<sha> ./canon-sync.sh`
 
 The files are already present from the unzip, so it's fast; it writes the {stats.get('plugins', n)}-plugin
 load order + archives into your OpenMW `openmw.cfg`, seeding one if you have none.
@@ -579,6 +580,7 @@ def roll(cfg_path: str, out_dir: str, *, bundle_dirs: Sequence[str],
     modlock_path = os.path.join(out_dir, "modlock.json")
     with open(modlock_path, "w", encoding="utf-8") as fh:
         json.dump(modlock, fh, indent=2)
+    manifest_sha = hash_file(modlock_path)[0]   # the value a friend pins via -ManifestSha / MANIFEST_SHA
 
     rdf = required_data_files(modlock, enforce_checksums=enforce_checksums)
     rdf_path = os.path.join(out_dir, "requiredDataFiles.json")
@@ -635,6 +637,7 @@ def roll(cfg_path: str, out_dir: str, *, bundle_dirs: Sequence[str],
         "stats": modlock["stats"],
         "plugins": [c["name"] for c in modlock["content"]],
         "enforce_checksums": enforce_checksums,
+        "manifest_sha256": manifest_sha,
         "assertions": "passed",
     }
 
@@ -719,6 +722,20 @@ def main(argv=None):
     rep = {k: v for k, v in rep.items() if k != "plugins"}
     rep["roll_seconds"] = round(time.time() - t)
     print(json.dumps(rep, indent=2, default=str))
+
+    # Paste-ready friend invite. The manifest sha changes every roll and lives out-of-band in the
+    # invite, so print it beside the exact re-run command: "re-roll" and "the number friends verify
+    # against" can't drift. To stderr, so stdout stays clean JSON.
+    sha = rep.get("manifest_sha256", "")
+    print("\n".join([
+        "=" * 74,
+        "FRIEND INVITE (paste to the group; the manifest sha changed with this roll):",
+        "-" * 74,
+        "Canon updated. Run the sync script from inside your canon folder:",
+        f"  Windows:    powershell -ExecutionPolicy Bypass -File canon-sync.ps1 -ManifestSha {sha}",
+        f"  Mac/Linux:  MANIFEST_SHA={sha} ./canon-sync.sh",
+        "=" * 74,
+    ]), file=sys.stderr)
     return 0
 
 

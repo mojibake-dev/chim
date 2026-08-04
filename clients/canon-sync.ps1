@@ -3,16 +3,17 @@ canon-sync.ps1 -- keep a TES3MP canon folder byte-identical to the server, downl
 changed. Re-run any time; it is safe, idempotent, and self-verifying (every file is checked against
 the server manifest's SHA-256). No extra tooling: built-in curl.exe + Get-FileHash only.
 
-  Cold install : point -Canon at an empty folder, run  -> downloads the whole canon
-  Update       : after a re-roll, run again             -> only changed/new files, strays removed
+  Install : unzip the canon, then run this script FROM that folder -> it syncs its own folder
+  Update  : run it again after a re-roll                           -> only changed/new files, strays removed
 
-Your invite has the -Base token and the manifest SHA. Either edit the defaults below or pass them:
-  powershell -ExecutionPolicy Bypass -File canon-sync.ps1 -Base https://... -Canon C:\MW-Canon -ManifestSha <sha>
+It syncs the folder it lives in, so no path is needed. Your invite has the manifest SHA:
+  powershell -ExecutionPolicy Bypass -File canon-sync.ps1 -ManifestSha <sha>
+(Different cwd? It still targets its own folder via $PSScriptRoot. Override with -Canon only if you must.)
 #>
 [CmdletBinding()]
 param(
   [string]  $Base        = "https://canon.gaussing.tv/049b7997d13572010d849e8b",  # the vvardenfell canon endpoint
-  [string]  $Canon       = "$env:USERPROFILE\MW-Canon",
+  [string]  $Canon       = "",   # default: the folder THIS script lives in (it ships inside the canon dir)
   [string]  $ManifestSha = "",
   [string]  $Cfg         = "",   # the ACTIVE openmw.cfg to sync the load order into (default: this OS's OpenMW config path)
   [string[]]$Ignore      = @("openmw.cfg","INSTALL.md","tes3mp-client-default.cfg","modlock.json","requiredDataFiles.json","canon-sync.ps1","canon-sync.sh")
@@ -20,6 +21,9 @@ param(
 $ErrorActionPreference = "Stop"
 function Sha256([string]$p){ (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() }
 
+# no -Canon given -> sync the folder THIS script lives in (self-locate; the script ships inside the
+# canon dir, so its own directory IS the canon). $PSScriptRoot is set when run via -File.
+if (-not $Canon) { $Canon = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path } }
 $Canon = (New-Item -ItemType Directory -Force $Canon).FullName.TrimEnd('\')
 $tmp   = Join-Path $env:TEMP ("modlock.{0}.json" -f $PID)
 
@@ -37,12 +41,21 @@ $ig = @{}; foreach ($i in $Ignore) { $ig[$i] = $true }
 Write-Host ("manifest: {0} files -> {1}" -f $want.Count, $Canon)
 
 # 2. download only what's missing or changed (each verified against the manifest before it lands).
-$ok=0; $dl=0; $fail=@()
+#    Progress ticks every ~10% of the scan so a full 82k-file hash pass never looks hung, and every
+#    actual download names its file (so a small update shows exactly what it pulled).
+$ok=0; $dl=0; $fail=@(); $seen=0; $nextPct=10; $total=$want.Count
+Write-Host ("verifying {0} local files against the manifest (full hash scan)..." -f $total)
 foreach ($path in $want.Keys) {
+  $seen++
+  if ($total -gt 0 -and ($seen * 100 / $total) -ge $nextPct) {
+    Write-Host ("  scanned {0}% ({1}/{2}); {3} fetched so far" -f [int]$nextPct, $seen, $total, $dl)
+    while ($total -gt 0 -and ($seen * 100 / $total) -ge $nextPct) { $nextPct += 10 }
+  }
   $local = Join-Path $Canon ($path -replace '/','\')
   if ((Test-Path -LiteralPath $local) -and ((Sha256 $local) -eq $want[$path])) { $ok++; continue }
   New-Item -ItemType Directory -Force (Split-Path -Parent $local) | Out-Null
   $enc = ($path.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+  Write-Host "  down: $path"
   curl.exe -fsSL --retry 5 --retry-delay 2 -o "$local.part" "$Base/tree/$enc"
   if ($LASTEXITCODE -ne 0)                     { $fail += $path;          Remove-Item "$local.part" -Force -EA SilentlyContinue; continue }
   if ((Sha256 "$local.part") -ne $want[$path]) { $fail += "$path (hash)"; Remove-Item "$local.part" -Force -EA SilentlyContinue; continue }

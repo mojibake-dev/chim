@@ -3,14 +3,16 @@
 # changed. Re-run any time; safe, idempotent, self-verifying (every file checked against the manifest
 # SHA-256). POSIX sh + curl + jq + (sha256sum|shasum).
 #
-#   Cold install : CANON=empty-folder ./canon-sync.sh   -> downloads the whole canon
-#   Update       : ./canon-sync.sh                       -> only changed/new files, strays removed
+#   Install : unzip the canon, then run this script FROM that folder -> it syncs its own folder
+#   Update  : ./canon-sync.sh                                        -> only changed/new files, strays removed
 #
-# Your invite has BASE's token and MANIFEST_SHA. Set them via env:
-#   BASE=https://canon.gaussing.tv/TOKEN  CANON=~/Games/MW-Canon  MANIFEST_SHA=<sha>  ./canon-sync.sh
+# It syncs the folder it lives in, so no path is needed. Your invite has the manifest SHA:
+#   MANIFEST_SHA=<sha> ./canon-sync.sh        (override the folder with CANON=... only if you must)
 set -eu
 BASE="${BASE:-https://canon.gaussing.tv/049b7997d13572010d849e8b}"   # the vvardenfell canon endpoint
-CANON="${CANON:-$HOME/Games/MW-Canon}"
+# no CANON given -> sync the folder THIS script lives in (self-locate; the script ships inside the
+# canon dir, so its own directory IS the canon). Override with CANON=... if you run it from elsewhere.
+CANON="${CANON:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)}"
 MANIFEST_SHA="${MANIFEST_SHA:-}"
 CFG="${CFG:-}"   # the ACTIVE openmw.cfg to sync the load order into (default: this OS's OpenMW config path)
 # files the sync never downloads or deletes (per-friend configs + docs)
@@ -36,14 +38,23 @@ mkdir -p "$CANON"
 jq -r '.files[] | [.path, .sha256] | @tsv' "$work/modlock.json" > "$work/want.tsv"
 echo "manifest: $(wc -l < "$work/want.tsv" | tr -d ' ') files -> $CANON"
 
-# 2. download only missing/changed (each verified vs the manifest before it lands).
-ok=0; dl=0; fail=0
+# 2. download only missing/changed (each verified vs the manifest before it lands). Progress ticks
+#    every ~10% of the scan so a full 82k-file hash pass never looks hung; each download names its file.
+ok=0; dl=0; fail=0; seen=0; nextpct=10
+total=$(wc -l < "$work/want.tsv" | tr -d ' ')
+echo "verifying $total local files against the manifest (full hash scan)..."
 while IFS="$TAB" read -r path sha; do
   [ -n "$path" ] || continue
+  seen=$((seen+1))
+  if [ "$total" -gt 0 ] && [ $((seen * 100 / total)) -ge "$nextpct" ]; then
+    echo "  scanned ${nextpct}% ($seen/$total); $dl fetched so far"
+    while [ $((seen * 100 / total)) -ge "$nextpct" ]; do nextpct=$((nextpct+10)); done
+  fi
   local="$CANON/$path"
   if [ -f "$local" ] && [ "$(sha256 "$local")" = "$sha" ]; then ok=$((ok+1)); continue; fi
   mkdir -p "$(dirname "$local")"
   enc="$(printf '%s' "$path" | jq -sRr '@uri' | sed 's/%2F/\//g')"   # url-encode, keep the slashes
+  echo "  down: $path"
   if curl -fsSL --retry 5 --retry-delay 2 -o "$local.part" "$BASE/tree/$enc" \
      && [ "$(sha256 "$local.part")" = "$sha" ]; then
     mv -f "$local.part" "$local"; dl=$((dl+1))
