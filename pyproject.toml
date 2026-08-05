@@ -15,6 +15,7 @@ keywords = ["skyrim", "esp", "esm", "bethesda", "plugin", "modding", "mcp"]
 dependencies = [
     "mcp",
     "esplib",
+    "discord-webhook>=1.4.1",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,7 @@ dev = [
 [project.scripts]
 chim-mcp = "chim.server:main"
 chim-roll = "chim.modlock:main"
+chim-discord = "chim.discord:main"
 
 [tool.setuptools]
 packages = ["chim", "chim.esp", "chim.save", "chim.tes3"]

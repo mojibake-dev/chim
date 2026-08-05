@@ -35,3 +35,10 @@ forbid = ["Better Robes", "Better Clothes", "Khajiit-", "New Argonian Bodies",
 fork        = "tes3mp"
 openmw_base = "0.47"
 protocol    = 10
+
+# `chim-discord` refreshes the #setup-and-support post (instructions + both scripts) after a roll.
+# The webhook URL is a secret, kept in the macOS keychain, NOT here:
+#   security add-generic-password -a discord -s canon-discord-webhook -w '<webhook-url>'
+[discord]
+keychain_account = "discord"
+keychain_service = "canon-discord-webhook"
