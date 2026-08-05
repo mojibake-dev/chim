@@ -13,6 +13,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import shutil
 import socketserver
 import subprocess
@@ -78,6 +79,18 @@ def _run(base, canon, cfg, settings, home, sha):
 
 def _active_data(cfg_text):
     return [l for l in cfg_text.splitlines() if l.strip().startswith("data=")]
+
+
+def test_ps1_has_no_scope_trap_variables():
+    """Static lint we CAN run without PowerShell: ``"$Name:"`` in a PowerShell string is read as a
+    scope/drive-qualified variable (``$scope:name``), so a bare ``$Cfg:`` is a parse error on Windows
+    that pytest (bash-only) would never see. Only ``$env:`` and the real PS scope prefixes are legit;
+    everything else must be written ``${name}:``. Guards the exact bug that shipped a broken .ps1."""
+    ps1 = open(os.path.join(REPO, "clients", "canon-sync.ps1"), encoding="utf-8").read()
+    allowed = {"env", "global", "local", "script", "private", "using", "variable", "workflow"}
+    bad = [m.group(0) for m in re.finditer(r"\$([A-Za-z_]\w*):", ps1)
+           if m.group(1).lower() not in allowed]
+    assert not bad, f"scope-trap variable refs in canon-sync.ps1 (write them as ${{name}}:): {bad}"
 
 
 def test_wires_canon_and_keeps_existing_base(tmp_path):

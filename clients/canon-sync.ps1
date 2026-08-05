@@ -129,7 +129,7 @@ $dataAdd = New-Object System.Collections.Generic.List[string]
 if ($baseDir)           { $dataAdd.Add('data="' + $baseDir + '"'); Write-Host "wired Morrowind data dir -> $baseDir" -ForegroundColor Green }
 if (-not $canonPresent) { $dataAdd.Add('data="' + $Canon + '"');   Write-Host "wired canon data dir -> $Canon" -ForegroundColor Green }
 if (-not $basePresent -and -not $baseDir) {
-  Write-Host "canon-sync: couldn't find your Morrowind 'Data Files' automatically -- add ONE line to $Cfg:" -ForegroundColor Yellow
+  Write-Host "canon-sync: couldn't find your Morrowind 'Data Files' automatically -- add ONE line to ${Cfg}:" -ForegroundColor Yellow
   Write-Host ('  data="C:\path\to\your\Morrowind\Data Files"   (see INSTALL.md)') -ForegroundColor Yellow
 }
 # single-pass axis rewrite: data= already wired above; replace each axis block at its FIRST line's
