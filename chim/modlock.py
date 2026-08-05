@@ -736,6 +736,16 @@ def main(argv=None):
         f"  Mac/Linux:  MANIFEST_SHA={sha} ./canon-sync.sh",
         "=" * 74,
     ]), file=sys.stderr)
+
+    # Post-roll: refresh the Discord support post, only if [discord] is configured. Non-fatal, the
+    # roll already succeeded, so a webhook/network hiccup never fails the roll.
+    if conf.get("discord"):
+        try:
+            from . import discord as _discord
+            mid, edited = _discord.push_support_post(conf, out_dir)
+            print(f"discord support post {'edited' if edited else 'posted'}: {mid}", file=sys.stderr)
+        except Exception as exc:
+            print(f"discord update skipped ({exc})", file=sys.stderr)
     return 0
 
 

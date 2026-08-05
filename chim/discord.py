@@ -70,51 +70,52 @@ def update_support_message(webhook_url: str, message_id: Optional[str], content:
     return str(hook.id or resp.json().get("id"))
 
 
-def main(argv=None) -> int:
-    """``chim-discord``: refresh the support post from a rolled canon + ``canon.toml``.
+def push_support_post(conf: dict, out_dir: str) -> Tuple[str, bool]:
+    """Post or refresh the support message from a rolled canon + its config.
 
-    Reads the webhook from the keychain (``[discord] keychain_service`` / ``keychain_account``),
-    the manifest sha from the rolled ``modlock.json``, and the two scripts from ``clients/``.
-    Persists the message id in ``<out_dir>/.discord_msg_id`` so reruns edit in place.
+    The reusable core of :func:`main`, also called by ``chim-roll``'s post-roll hook. Reads the
+    webhook from the keychain, the manifest sha from ``<out_dir>/modlock.json``, and both scripts
+    from ``clients/``; persists the message id in ``<out_dir>/.discord_msg_id``. Returns
+    ``(message_id, was_edit)``.
     """
+    dconf = conf.get("discord", {})
+    webhook = read_keychain(dconf.get("keychain_account", "discord"),
+                            dconf.get("keychain_service", "canon-discord-webhook"))
+    with open(os.path.join(out_dir, "modlock.json"), "rb") as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()   # the value a friend pins as MANIFEST_SHA
+    clients = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "clients")
+    files: List[Tuple[str, bytes]] = []
+    for fn in ("canon-sync.ps1", "canon-sync.sh"):
+        with open(os.path.join(clients, fn), "rb") as fh:
+            files.append((fn, fh.read()))
+    content = render_message(sha, conf.get("server_address", "the server"),
+                             conf.get("title", "Morrowind Canon"))
+    idfile = os.path.join(out_dir, ".discord_msg_id")
+    msg_id = open(idfile).read().strip() if os.path.exists(idfile) else None
+    was_edit = msg_id is not None
+    msg_id = update_support_message(webhook, msg_id, content, files)
+    with open(idfile, "w") as fh:
+        fh.write(msg_id)
+    return msg_id, was_edit
+
+
+def main(argv=None) -> int:
+    """``chim-discord``: refresh the support post from a rolled canon + ``canon.toml``."""
     import argparse
     import tomllib
 
     ap = argparse.ArgumentParser("chim-discord", description="refresh the canon support post in Discord")
     ap.add_argument("-c", "--config", default="canon.toml", help="path to canon.toml (default ./canon.toml)")
     args = ap.parse_args(argv)
-
     with open(args.config, "rb") as fh:
         conf = tomllib.load(fh)
-    exp = os.path.expanduser
-    out_dir = exp(conf["out_dir"])
-    dconf = conf.get("discord", {})
-    webhook = read_keychain(dconf.get("keychain_account", "discord"),
-                            dconf.get("keychain_service", "canon-discord-webhook"))
-
-    with open(os.path.join(out_dir, "modlock.json"), "rb") as fh:
-        sha = hashlib.sha256(fh.read()).hexdigest()   # the value a friend pins as MANIFEST_SHA
-
-    clients = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "clients")
-    files: List[Tuple[str, bytes]] = []
-    for fn in ("canon-sync.ps1", "canon-sync.sh"):
-        with open(os.path.join(clients, fn), "rb") as fh:
-            files.append((fn, fh.read()))
-
-    content = render_message(sha, conf.get("server_address", "the server"),
-                             conf.get("title", "Morrowind Canon"))
-    idfile = os.path.join(out_dir, ".discord_msg_id")
-    msg_id = open(idfile).read().strip() if os.path.exists(idfile) else None
-    was_edit = msg_id is not None
-
-    msg_id = update_support_message(webhook, msg_id, content, files)
-    with open(idfile, "w") as fh:
-        fh.write(msg_id)
-    print(f"discord support message {'edited' if was_edit else 'posted'}: id={msg_id}, sha={sha[:12]}...")
+    out_dir = os.path.expanduser(conf["out_dir"])
+    msg_id, was_edit = push_support_post(conf, out_dir)
+    print(f"discord support message {'edited' if was_edit else 'posted'}: id={msg_id}")
     return 0
 
 
-__all__ = ["update_support_message", "render_message", "read_keychain", "main"]
+__all__ = ["push_support_post", "update_support_message", "render_message", "read_keychain", "main"]
 
 
 if __name__ == "__main__":
