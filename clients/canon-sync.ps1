@@ -107,7 +107,8 @@ $haveData = @()
 foreach ($l in $oldLines) { if ($l -match '^\s*data\s*=\s*(.+)$') { $haveData += ($Matches[1].Trim().Trim('"')) } }
 $basePresent = $false; $canonPresent = $false
 foreach ($d in ($haveData + $Canon)) { if ($d -and (Test-Path -LiteralPath (Join-Path $d 'Morrowind.esm'))) { $basePresent = $true } }
-foreach ($d in $haveData) { if ($d -eq $Canon) { $canonPresent = $true } }
+function Norm([string]$p){ $p.Replace('/','\').TrimEnd('\').ToLower() }   # C:/x, C:\x\, C:\X all equal
+foreach ($d in $haveData) { if ((Norm $d) -eq (Norm $Canon)) { $canonPresent = $true } }
 $baseDir = ""
 if (-not $basePresent) {
   $cands = [System.Collections.Generic.List[string]]@(

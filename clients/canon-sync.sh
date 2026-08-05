@@ -110,7 +110,7 @@ base_present=0; canon_present=0
 while IFS= read -r d; do
   [ -n "$d" ] || continue
   if [ -f "$d/Morrowind.esm" ]; then base_present=1; fi
-  if [ "$d" = "$CANON" ]; then canon_present=1; fi
+  if [ "${d%/}" = "${CANON%/}" ]; then canon_present=1; fi   # ignore a trailing slash on either
 done < "$work/data.have"
 if [ -f "$CANON/Morrowind.esm" ]; then base_present=1; fi   # (the canon never ships it, but be safe)
 base_dir=""
