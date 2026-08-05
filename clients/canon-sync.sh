@@ -94,8 +94,44 @@ mkdir -p "$(dirname "$CFG")"
 if [ ! -f "$CFG" ]; then
   if [ -f "$CANON/openmw.cfg" ]; then cp "$CANON/openmw.cfg" "$CFG"
   else curl -fsSL --retry 5 --retry-delay 2 -o "$CFG" "$BASE/openmw.cfg" || : ; fi
-  echo "seeded a fresh openmw.cfg at $CFG (uncomment your OS's data= lines -- see INSTALL.md)"
+  echo "seeded a fresh openmw.cfg at $CFG"
 fi
+# 4a. self-wire the two data= dirs OpenMW needs: THIS canon folder ($CANON, known for certain) and
+#     your vanilla Morrowind 'Data Files'. Add only what's MISSING (any data= you already have is
+#     kept), so the friend never hand-edits the cfg. The base game is autodetected in the usual Steam/
+#     GOG spots; if we can't find it we print the one line to add. Only ACTIVE (uncommented) data= count.
+grep -E '^[[:space:]]*data[[:space:]]*=' "$CFG" 2>/dev/null \
+  | sed -E 's/^[[:space:]]*data[[:space:]]*=[[:space:]]*//; s/^"//; s/"$//' > "$work/data.have" || :
+[ -f "$work/data.have" ] || : > "$work/data.have"
+base_present=0; canon_present=0
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  if [ -f "$d/Morrowind.esm" ]; then base_present=1; fi
+  if [ "$d" = "$CANON" ]; then canon_present=1; fi
+done < "$work/data.have"
+if [ -f "$CANON/Morrowind.esm" ]; then base_present=1; fi   # (the canon never ships it, but be safe)
+base_dir=""
+if [ "$base_present" = 0 ]; then
+  for cand in \
+    "$HOME/Library/Application Support/Steam/steamapps/common/Morrowind/Data Files" \
+    "$HOME/.steam/steam/steamapps/common/Morrowind/Data Files" \
+    "$HOME/.local/share/Steam/steamapps/common/Morrowind/Data Files" \
+    "$HOME/.steam/root/steamapps/common/Morrowind/Data Files" \
+    "/c/Program Files (x86)/Steam/steamapps/common/Morrowind/Data Files" \
+    "/c/Program Files (x86)/GOG Galaxy/Games/Morrowind/Data Files" \
+    "/c/Program Files (x86)/Bethesda Softworks/Morrowind/Data Files" \
+    "$HOME/GOG Games/Morrowind/Data Files"; do
+    if [ -f "$cand/Morrowind.esm" ]; then base_dir="$cand"; break; fi
+  done
+fi
+: > "$work/data.add"
+if [ -n "$base_dir" ]; then printf 'data="%s"\n' "$base_dir" >> "$work/data.add"; echo "wired Morrowind data dir -> $base_dir"; fi
+if [ "$canon_present" = 0 ]; then printf 'data="%s"\n' "$CANON" >> "$work/data.add"; echo "wired canon data dir -> $CANON"; fi
+if [ "$base_present" = 0 ] && [ -z "$base_dir" ]; then
+  echo "canon-sync: couldn't find your Morrowind 'Data Files' automatically -- add ONE line to $CFG:" >&2
+  echo "  data=\"/path/to/your/Morrowind/Data Files\"   (see INSTALL.md)" >&2
+fi
+cat "$work/data.add" "$CFG" > "$work/cfg.data"   # the axis pass below rewrites THIS (data= already wired)
 # the three axis blocks, one value per line, in manifest order (names are quote-free -> emit bare).
 jq -r '.content[].name' "$work/modlock.json" > "$work/ax.content"
 jq -r '.archives[]'     "$work/modlock.json" > "$work/ax.fallback-archive"
@@ -113,7 +149,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     groundcover)      [ "$d_gc"      = 0 ] && { sed 's/^/groundcover=/'      "$work/ax.groundcover"      >> "$work/cfg.new"; d_gc=1;      }; continue ;;
   esac
   printf '%s\n' "$line" >> "$work/cfg.new"
-done < "$CFG"
+done < "$work/cfg.data"
 [ "$d_content" = 0 ] && sed 's/^/content=/'          "$work/ax.content"          >> "$work/cfg.new"
 [ "$d_fa"      = 0 ] && sed 's/^/fallback-archive=/' "$work/ax.fallback-archive" >> "$work/cfg.new"
 [ "$d_gc"      = 0 ] && sed 's/^/groundcover=/'      "$work/ax.groundcover"      >> "$work/cfg.new"

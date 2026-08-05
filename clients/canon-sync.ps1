@@ -95,14 +95,49 @@ if (-not (Test-Path -LiteralPath $Cfg)) {
   $seed = Join-Path $Canon 'openmw.cfg'
   if (Test-Path -LiteralPath $seed) { Copy-Item -LiteralPath $seed -Destination $Cfg -Force }
   else { curl.exe -fsSL --retry 5 --retry-delay 2 -o $Cfg "$Base/openmw.cfg" | Out-Null }
-  Write-Host "seeded a fresh openmw.cfg at $Cfg (uncomment your OS's data= lines -- see INSTALL.md)" -ForegroundColor Yellow
+  Write-Host "seeded a fresh openmw.cfg at $Cfg" -ForegroundColor Yellow
 }
-# single-pass axis rewrite: replace each axis block at its FIRST line's position, drop later lines
-# of that axis, append any axis absent originally (canonical order), keep all else verbatim.
 $old = [System.IO.File]::ReadAllText($Cfg)
+$oldLines = $old -split "`r`n|`n|`r", -1
+# 4a. self-wire the two data= dirs OpenMW needs: THIS canon folder ($Canon, known for certain) and your
+#     vanilla Morrowind 'Data Files'. Add only what's MISSING (any data= you already have is kept), so
+#     the friend never hand-edits the cfg. The base game is autodetected in the usual Steam/GOG spots
+#     (plus every Steam library in libraryfolders.vdf); if not found we print the one line to add.
+$haveData = @()
+foreach ($l in $oldLines) { if ($l -match '^\s*data\s*=\s*(.+)$') { $haveData += ($Matches[1].Trim().Trim('"')) } }
+$basePresent = $false; $canonPresent = $false
+foreach ($d in ($haveData + $Canon)) { if ($d -and (Test-Path -LiteralPath (Join-Path $d 'Morrowind.esm'))) { $basePresent = $true } }
+foreach ($d in $haveData) { if ($d -eq $Canon) { $canonPresent = $true } }
+$baseDir = ""
+if (-not $basePresent) {
+  $cands = [System.Collections.Generic.List[string]]@(
+    "C:\Program Files (x86)\Steam\steamapps\common\Morrowind\Data Files",
+    "C:\Program Files\Steam\steamapps\common\Morrowind\Data Files",
+    "C:\GOG Games\Morrowind\Data Files",
+    "C:\Program Files (x86)\GOG Galaxy\Games\Morrowind\Data Files",
+    "C:\Program Files (x86)\Bethesda Softworks\Morrowind\Data Files"
+  )
+  $vdf = "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf"   # Steam libraries on other drives
+  if (Test-Path -LiteralPath $vdf) {
+    foreach ($m in [regex]::Matches([System.IO.File]::ReadAllText($vdf), '"path"\s*"([^"]+)"')) {
+      $cands.Add((Join-Path ($m.Groups[1].Value -replace '\\\\','\') "steamapps\common\Morrowind\Data Files"))
+    }
+  }
+  foreach ($c in $cands) { if (Test-Path -LiteralPath (Join-Path $c 'Morrowind.esm')) { $baseDir = $c; break } }
+}
+$dataAdd = New-Object System.Collections.Generic.List[string]
+if ($baseDir)           { $dataAdd.Add('data="' + $baseDir + '"'); Write-Host "wired Morrowind data dir -> $baseDir" -ForegroundColor Green }
+if (-not $canonPresent) { $dataAdd.Add('data="' + $Canon + '"');   Write-Host "wired canon data dir -> $Canon" -ForegroundColor Green }
+if (-not $basePresent -and -not $baseDir) {
+  Write-Host "canon-sync: couldn't find your Morrowind 'Data Files' automatically -- add ONE line to $Cfg:" -ForegroundColor Yellow
+  Write-Host ('  data="C:\path\to\your\Morrowind\Data Files"   (see INSTALL.md)') -ForegroundColor Yellow
+}
+# single-pass axis rewrite: data= already wired above; replace each axis block at its FIRST line's
+# position, drop later lines of that axis, append any axis absent originally, keep all else verbatim.
 $out = New-Object System.Collections.Generic.List[string]
+foreach ($a in $dataAdd) { $out.Add($a) }
 $done = @{}
-foreach ($line in ($old -split "`r`n|`n|`r", -1)) {
+foreach ($line in $oldLines) {
   $key = if ($line -match '=') { ($line -split '=',2)[0].Trim().ToLower() } else { $null }
   if ($key -and $axes.Contains($key)) {
     if (-not $done.ContainsKey($key)) { foreach ($v in $axes[$key]) { $out.Add("$key=$v") }; $done[$key] = $true }

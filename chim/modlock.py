@@ -377,7 +377,8 @@ def render_install_md(modlock: Dict, *, zip_name: str, zip_sha256: Optional[str]
         return f"""# {title}
 
 **The sync script does the work.** It downloads the canon, verifies every file against the manifest,
-AND writes the load order into your OpenMW config. Run it once to install, re-run it to update.
+writes the load order into your OpenMW config, AND wires the two `data=` paths for you (this canon
+folder + your Morrowind install). Run it once to install, re-run it to update.
 `canon-sync.ps1` (Windows) and `canon-sync.sh` (macOS/Linux) are right here in this folder.
 
 ## 1. Run the sync script
@@ -389,12 +390,14 @@ Keep this unzipped folder somewhere permanent; it's your **canon dir**. Then run
 - **macOS/Linux:** `MANIFEST_SHA=<sha> ./canon-sync.sh`
 
 The files are already present from the unzip, so it's fast; it writes the {stats.get('plugins', n)}-plugin
-load order + archives into your OpenMW `openmw.cfg`, seeding one if you have none.
+load order + archives into your OpenMW `openmw.cfg` (seeding one if you have none) and points it at
+this canon folder plus your vanilla Morrowind `Data Files`, which it autodetects.
 
-## 2. Uncomment your `data=` lines
+## 2. Only if the script couldn't find Morrowind
 
-Open that `openmw.cfg` and **uncomment the two `data=` lines for your OS** (delete the leading `#`),
-fixing the paths: your vanilla Morrowind `Data Files`, then this canon folder.
+The script wires both `data=` paths itself, so usually there's nothing to do here. It only needs you
+if it printed **"couldn't find your Morrowind 'Data Files' automatically"** -- then open your
+`openmw.cfg` and add one line: `data="<path to your vanilla Morrowind Data Files>"`. The config is at:
 
 - **Windows:** `Documents\\My Games\\OpenMW\\openmw.cfg`
 - **macOS:** `~/Library/Preferences/openmw/openmw.cfg`
@@ -535,13 +538,13 @@ _CLIENT_CFG_HEADER = (
     "# TES3MP canon openmw.cfg -- pre-rolled by chim.\n"
     "#   * See INSTALL.md for where to place this file (your OpenMW config dir); MERGE it into any\n"
     "#     existing openmw.cfg and keep the fallback=/settings your OpenMW wizard added.\n"
-    "#   * The one edit: UNCOMMENT the two data= lines for YOUR OS below (delete the leading #) and\n"
-    "#     fix the paths -- your vanilla Morrowind 'Data Files', then the folder you unzipped the\n"
-    "#     canon into. Everything below data= (archives + load order) is already correct; leave it."
+    "#   * The sync script wires your data= lines automatically (this canon dir + your Morrowind\n"
+    "#     'Data Files', autodetected). The per-OS #data= lines below are just reference/fallback for\n"
+    "#     if it can't find your install. Everything below (archives + load order) is already correct."
 )
 
 # Per-OS example data= pairs (vanilla Data Files, then the unzipped canon dir) chim emits COMMENTED
-# in the distributable openmw.cfg -- the friend uncomments the pair for their platform.
+# in the distributable openmw.cfg -- reference/fallback only; the sync script wires the real ones.
 _OS_DATA_OPTIONS = (
     ("Windows", ("C:/Program Files (x86)/Steam/steamapps/common/Morrowind/Data Files", "C:/MW-Canon")),
     ("macOS", ("/Users/YOU/Games/Morrowind/Data Files", "/Users/YOU/Games/MW-Canon")),
