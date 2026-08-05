@@ -15,6 +15,7 @@ BASE="${BASE:-https://canon.gaussing.tv/049b7997d13572010d849e8b}"   # the vvard
 CANON="${CANON:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)}"
 MANIFEST_SHA="${MANIFEST_SHA:-}"
 CFG="${CFG:-}"   # the ACTIVE openmw.cfg to sync the load order into (default: this OS's OpenMW config path)
+SETTINGS_CFG="${SETTINGS_CFG:-}"   # the ACTIVE settings.cfg for canon gameplay settings (default: this OS's path)
 # files the sync never downloads or deletes (per-friend configs + docs)
 IGNORE=" openmw.cfg INSTALL.md tes3mp-client-default.cfg modlock.json requiredDataFiles.json canon-sync.ps1 canon-sync.sh "
 
@@ -125,6 +126,52 @@ else
   echo "load order synced -> $CFG ($n_content content plugins; backup written)."
 fi
 
+# 5. enforce the canon's gameplay settings in the ACTIVE settings.cfg (a section-aware INI, unlike
+#    openmw.cfg): keep each listed [Game] key at the canon value, add it if absent, leave every other
+#    line (the friend's own graphics prefs) untouched. Currently: stop NPCs shoving the player around.
+if [ -z "$SETTINGS_CFG" ]; then
+  case "$(uname -s)" in
+    Darwin)  SETTINGS_CFG="$HOME/Library/Preferences/openmw/settings.cfg" ;;
+    Linux)   SETTINGS_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/openmw/settings.cfg" ;;
+    *)       SETTINGS_CFG="$HOME/Documents/My Games/OpenMW/settings.cfg" ;;
+  esac
+fi
+if [ -f "$SETTINGS_CFG" ]; then
+  awk '
+    /^\[Game\]/ { ing=1; print; next }
+    /^\[/       { if (ing) { if(!d1){print "NPCs avoid collisions = true";d1=1} if(!d2){print "Standing NPCs give way to moving ones = true";d2=1} } ing=0; print; next }
+    { if (ing) { k=$0; sub(/[ \t]*=.*/,"",k); sub(/^[ \t]+/,"",k)
+        if(k=="NPCs avoid collisions"){print "NPCs avoid collisions = true";d1=1;next}
+        if(k=="Standing NPCs give way to moving ones"){print "Standing NPCs give way to moving ones = true";d2=1;next} }
+      print }
+    END { if (ing) { if(!d1)print "NPCs avoid collisions = true"; if(!d2)print "Standing NPCs give way to moving ones = true" }
+          else if(!d1||!d2){ print "[Game]"; if(!d1)print "NPCs avoid collisions = true"; if(!d2)print "Standing NPCs give way to moving ones = true" } }
+  ' "$SETTINGS_CFG" > "$work/settings.new"
+  if cmp -s "$work/settings.new" "$SETTINGS_CFG"; then
+    echo "gameplay settings already applied."
+  else
+    cp "$SETTINGS_CFG" "$SETTINGS_CFG.$(date +%Y%m%d-%H%M%S).bak"
+    mv -f "$work/settings.new" "$SETTINGS_CFG"
+    echo "gameplay settings applied -> $SETTINGS_CFG (NPC collision avoidance; backup written)."
+  fi
+else
+  mkdir -p "$(dirname "$SETTINGS_CFG")"
+  printf '[Game]\nNPCs avoid collisions = true\nStanding NPCs give way to moving ones = true\n' > "$SETTINGS_CFG"
+  echo "created settings.cfg with canon gameplay settings -> $SETTINGS_CFG"
+fi
+
 echo "sync: $ok up-to-date, $dl downloaded, $del removed"
 [ "$fail" -eq 0 ] || { echo "canon-sync: $fail file(s) FAILED" >&2; exit 1; }
 echo "canon in sync."
+
+# 6. self-update: refresh both canon-sync.* from the server so a script change propagates on its own
+#    after the first manual hand-out (no more re-downloading). Done LAST, after all logic has run, so
+#    replacing the running script can't corrupt this execution; the new version applies on the NEXT run.
+#    Backfills a missing script too (e.g. a Windows box gains the .sh), and stays quiet when unchanged.
+for s in canon-sync.sh canon-sync.ps1; do
+  if curl -fsSL --retry 3 --retry-delay 2 -o "$work/$s.dl" "$BASE/$s" 2>/dev/null; then
+    if [ ! -f "$CANON/$s" ] || ! cmp -s "$work/$s.dl" "$CANON/$s"; then
+      cp "$work/$s.dl" "$CANON/$s"; echo "self-update: $s refreshed (re-run to use the new version)"
+    fi
+  fi
+done

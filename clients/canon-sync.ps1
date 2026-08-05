@@ -16,6 +16,7 @@ param(
   [string]  $Canon       = "",   # default: the folder THIS script lives in (it ships inside the canon dir)
   [string]  $ManifestSha = "",
   [string]  $Cfg         = "",   # the ACTIVE openmw.cfg to sync the load order into (default: this OS's OpenMW config path)
+  [string]  $SettingsCfg = "",   # the ACTIVE settings.cfg for canon gameplay settings (default: this OS's path)
   [string[]]$Ignore      = @("openmw.cfg","INSTALL.md","tes3mp-client-default.cfg","modlock.json","requiredDataFiles.json","canon-sync.ps1","canon-sync.sh")
 )
 $ErrorActionPreference = "Stop"
@@ -121,7 +122,59 @@ if ($new -eq $old) {
     $Cfg, $axes['content'].Count, $axes['fallback-archive'].Count, $axes['groundcover'].Count, $stamp) -ForegroundColor Green
 }
 
+# 5. enforce the canon's gameplay settings in the ACTIVE settings.cfg (a section-aware INI, unlike
+#    openmw.cfg): keep each [Game] key at the canon value, add if absent, leave the friend's own
+#    graphics prefs untouched. Currently: stop NPCs shoving the player around.
+if (-not $SettingsCfg) { $SettingsCfg = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\OpenMW\settings.cfg' }
+$wantGame = [ordered]@{ 'NPCs avoid collisions' = 'true'; 'Standing NPCs give way to moving ones' = 'true' }
+New-Item -ItemType Directory -Force (Split-Path -Parent $SettingsCfg) | Out-Null
+if (Test-Path -LiteralPath $SettingsCfg) {
+  $sold = [System.IO.File]::ReadAllText($SettingsCfg)
+  $sout = New-Object System.Collections.Generic.List[string]; $inGame = $false; $sdone = @{}
+  foreach ($line in ($sold -split "`r`n|`n|`r", -1)) {
+    if ($line -match '^\[Game\]') { $inGame = $true; $sout.Add($line); continue }
+    if ($line -match '^\[') {
+      if ($inGame) { foreach ($k in $wantGame.Keys) { if (-not $sdone.ContainsKey($k)) { $sout.Add("$k = $($wantGame[$k])"); $sdone[$k]=$true } } }
+      $inGame = $false; $sout.Add($line); continue
+    }
+    if ($inGame -and $line -match '=') {
+      $k = ($line -split '=',2)[0].Trim()
+      if ($wantGame.Contains($k)) { $sout.Add("$k = $($wantGame[$k])"); $sdone[$k]=$true; continue }
+    }
+    $sout.Add($line)
+  }
+  if ($inGame) { foreach ($k in $wantGame.Keys) { if (-not $sdone.ContainsKey($k)) { $sout.Add("$k = $($wantGame[$k])"); $sdone[$k]=$true } } }
+  if ($sdone.Count -lt $wantGame.Count) { $sout.Add('[Game]'); foreach ($k in $wantGame.Keys) { if (-not $sdone.ContainsKey($k)) { $sout.Add("$k = $($wantGame[$k])") } } }
+  $snew = (($sout -join "`n").TrimEnd("`n")) + "`n"
+  if ($snew -eq $sold) { Write-Host "gameplay settings already applied." }
+  else {
+    $st = Get-Date -Format 'yyyyMMdd-HHmmss'
+    Copy-Item -LiteralPath $SettingsCfg -Destination "$SettingsCfg.$st.bak" -Force
+    [System.IO.File]::WriteAllText($SettingsCfg, $snew, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "gameplay settings applied -> $SettingsCfg (NPC collision avoidance; backup .$st.bak)" -ForegroundColor Green
+  }
+} else {
+  [System.IO.File]::WriteAllText($SettingsCfg, "[Game]`nNPCs avoid collisions = true`nStanding NPCs give way to moving ones = true`n", (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host "created settings.cfg with canon gameplay settings -> $SettingsCfg" -ForegroundColor Yellow
+}
+
 Remove-Item $tmp -Force -EA SilentlyContinue
 Write-Host ("sync: {0} up-to-date, {1} downloaded, {2} removed" -f $ok,$dl,$del)
 if ($fail.Count) { Write-Host ("FAILED ({0}): {1}" -f $fail.Count, ($fail -join ', ')) -ForegroundColor Red; exit 1 }
 Write-Host "canon in sync." -ForegroundColor Green
+
+# 6. self-update: refresh both canon-sync.* from the server so a script change propagates on its own
+#    after the first manual hand-out. Applies on the next run; backfills a missing script; quiet when
+#    unchanged. (PowerShell reads the whole script at start, so replacing the file now is safe.)
+foreach ($s in @('canon-sync.ps1','canon-sync.sh')) {
+  $dst = Join-Path $Canon $s; $dl = Join-Path $env:TEMP "$s.dl"
+  curl.exe -fsSL --retry 3 --retry-delay 2 -o $dl "$Base/$s" 2>$null
+  if ($LASTEXITCODE -eq 0 -and (Test-Path $dl)) {
+    $prev = if (Test-Path -LiteralPath $dst) { [System.IO.File]::ReadAllText($dst) } else { "" }
+    if ([System.IO.File]::ReadAllText($dl) -ne $prev) {
+      Copy-Item -LiteralPath $dl -Destination $dst -Force
+      Write-Host "self-update: $s refreshed (re-run to use the new version)" -ForegroundColor Cyan
+    }
+    Remove-Item $dl -Force -EA SilentlyContinue
+  }
+}
