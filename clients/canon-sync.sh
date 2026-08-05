@@ -68,7 +68,10 @@ done < "$work/want.tsv"
 del=0
 cut -f1 "$work/want.tsv" | LC_ALL=C sort > "$work/want.paths"
 ( cd "$CANON" && find . -type f ) | sed 's|^\./||' | LC_ALL=C sort > "$work/have.paths"
-comm -23 "$work/have.paths" "$work/want.paths" > "$work/strays"
+# comm MUST use the same collation as the two `LC_ALL=C sort`s above; without it, comm compares under
+# the friend's ambient locale, sees C-sorted input as "not in sorted order", warns AND exits non-zero
+# -> `set -eu` aborts the whole sync at stray-removal on any non-C locale. Force C here too.
+LC_ALL=C comm -23 "$work/have.paths" "$work/want.paths" > "$work/strays"
 while IFS= read -r stray; do
   [ -n "$stray" ] || continue
   base="${stray##*/}"

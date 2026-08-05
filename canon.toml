@@ -22,7 +22,7 @@ bundle_dirs = [                                        # where the loose assets 
 ]
 
 enforce_checksums = true
-expect_plugins    = 154                                # THE single source of truth for the count
+expect_plugins    = 151                                # THE single source of truth for the count
 zip_name          = "morrowind-canon.zip"
 server_address    = "vvardenfell.gaussing.tv:25565"
 title             = "Vvardenfell Multiplayer -- Concept-Art Canon"

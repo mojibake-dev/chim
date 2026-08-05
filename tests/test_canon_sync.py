@@ -128,6 +128,35 @@ def test_wires_canon_and_keeps_existing_base(tmp_path):
         cleanup()
 
 
+def test_stray_removal_survives_utf8_locale(tmp_path):
+    """comm MUST use the same C collation as the sorts feeding it. Under a non-C locale, comm reads the
+    C-sorted lists as 'not in sorted order', warns, and exits non-zero -> `set -eu` aborts the sync at
+    stray removal (a friend on en_US.UTF-8 hit exactly this). Reproduce with a stray 'Z.txt' that sorts
+    BEFORE the manifest files in C (ASCII: Z<a) but AFTER them under UTF-8 collation (a<Z)."""
+    have_locale = "en_US.UTF-8" in subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout
+    if not have_locale:
+        pytest.skip("no en_US.UTF-8 locale available to reproduce the collation mismatch")
+    served = tmp_path / "served"; served.mkdir()
+    sha = _build_served(served)
+    base, cleanup = _serve(served)
+    try:
+        canon = tmp_path / "canon"; canon.mkdir()
+        home = tmp_path / "home"; home.mkdir()
+        (canon / "a.txt").write_bytes(b"aaa\n")                 # in-sync manifest files
+        (canon / "sub").mkdir(); (canon / "sub" / "b.txt").write_bytes(b"bbb\n")
+        (canon / "Z.txt").write_bytes(b"stray\n")               # a stray to remove (C: Z<a, UTF-8: a<Z)
+        cfg = tmp_path / "openmw.cfg"; settings = tmp_path / "settings.cfg"
+        cfg.write_text("content=Old.esp\n")                     # pre-exist so we test phase 3, not the seed
+        env = dict(os.environ, BASE=base, CANON=str(canon), CFG=str(cfg), SETTINGS_CFG=str(settings),
+                   HOME=str(home), MANIFEST_SHA=sha, LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8")
+        r = subprocess.run(["sh", SCRIPT], env=env, capture_output=True, text=True, timeout=120)
+        assert "not in sorted order" not in r.stderr, r.stderr   # comm no longer trips
+        assert r.returncode == 0, r.stderr                       # sync completed (didn't abort)
+        assert not (canon / "Z.txt").exists()                    # the stray was actually removed
+    finally:
+        cleanup()
+
+
 def test_cold_seed_warns_when_morrowind_not_found(tmp_path):
     """Cold client (no cfg): seeds from the shipped openmw.cfg, wires the canon dir, and when it can't
     autodetect Morrowind it warns without inventing a bogus base data= line."""
