@@ -92,6 +92,51 @@ _XLKR = struct.Struct("<II")     # keyword formID + ref formID
 _XESP = struct.Struct("<II")     # parent formID + flags
 _OBND = struct.Struct("<6h")     # x1,y1,z1,x2,y2,z2 (int16)
 
+# --------------------------------------------------------------------------- #
+# FormID subrecord table for records esplib does NOT schema-register.
+# --------------------------------------------------------------------------- #
+#
+# esplib's tes5 registry only covers a curated set of record types (GMST, GLOB,
+# KYWD, FLST, WEAP, ARMO, ... -- see esplib.defs.tes5.register). Placement
+# records (REFR/ACHR/...) and CELL/WRLD are NOT registered, so a schema-only
+# FormID walk would silently MISS their formIDs (NAME base ref, XLKR links, XESP
+# enable-parent, worldspace/location refs) and corrupt them on a master-delete
+# renumber. We therefore curate the well-known, stable-layout Skyrim formID
+# subrecords here and use them for any record the schema cannot type.
+#
+# ONLY entries whose formID layout is unambiguous and well-documented are
+# listed; every offset is a real formID. A subrecord NOT in this table on an
+# unregistered record is left untouched by the renumber -- which is why
+# delete_master ALSO runs a conservative raw byte scan (over-approximate, scan-
+# only) so a dangling ref to the deleted master hiding in an un-typed subrecord
+# still trips the REFUSE guard rather than being silently miscounted.
+#
+# Layout values:
+#   ("fids", (o0, o1, ...))  -- formIDs at exactly these byte offsets
+#   ("array",)               -- a pure formID array (every 4 bytes is a formID)
+_FORMID_SUBREC_LAYOUT: Dict[str, Tuple] = {
+    # Placement (REFR/ACHR/ACRE/PGRE/PHZD/PARW/PBAR/PBEA/PCON/PFLA/PMIS)
+    "NAME": ("fids", (0,)),      # base object
+    "XLKR": ("fids", (0, 4)),    # keyword formID + linked-ref formID
+    "XESP": ("fids", (0,)),      # enable-parent formID (flags @4 = not a fid)
+    "XEZN": ("fids", (0,)),      # encounter zone
+    "XLCN": ("fids", (0,)),      # location
+    "XLRL": ("fids", (0,)),      # location ref
+    "XOWN": ("fids", (0,)),      # owner (NPC_/FACT)
+    "XLRT": ("array",),          # location-ref-type keyword formIDs
+    "XEMI": ("fids", (0,)),      # emittance (LIGH/REGN)
+    "XTEL": ("fids", (0,)),      # teleport door (formID @0, then pos/rot floats)
+    "XLTW": ("fids", (0,)),      # lock target ref
+    # CELL refs
+    "XCWT": ("fids", (0,)),      # cell water
+    "XCCM": ("fids", (0,)),      # cell climate/imagespace
+    "XCLR": ("array",),          # cell region list (REGN formIDs)
+    "LTMP": ("fids", (0,)),      # lighting template (LGTM)
+    "XCAS": ("fids", (0,)),      # acoustic space (ASPC)
+    "XCMO": ("fids", (0,)),      # music type (MUSC)
+    "XCImp": ("fids", (0,)),     # image space (IMGS)
+}
+
 
 # --------------------------------------------------------------------------- #
 # Load / serialize -- the bytes <-> Plugin seam
@@ -1091,6 +1136,290 @@ def rename_master(plug: Plugin, old: str, new: str) -> List[str]:
         if sr.signature == "MAST" and sr.get_string().lower() == old.lower():
             sr.set_string(new)
             break
+    plug.modified = True
+    return list(plug.header.masters)
+
+
+# --------------------------------------------------------------------------- #
+# Schema-driven FormID walk (used by delete_master's cascade renumber)
+# --------------------------------------------------------------------------- #
+#
+# esplib's ``Plugin._remap_subrecord_formids`` already knows, per record schema,
+# exactly which subrecord bytes are FormIDs (a plain ``EspFormID`` field, an
+# ``EspArray`` of ``EspFormID`` such as KWDA, FormID members inside an
+# ``EspStruct``, and the ``EspAlternateTextures`` MO?S blocks) plus the VMAD
+# Papyrus FormIDs. But that method is wired to the copy-record path
+# (normalize/denormalize through a ``plugin_set``, or ``remap_formid`` against a
+# *source* plugin) -- neither is what a master-delete needs. So we mirror its
+# schema logic here but drive a plain ``callback(fid: int) -> Optional[int]``
+# where ``None`` means "leave this FormID untouched".
+#
+# Crucially we DO NOT ``bind_schema`` onto the live records: binding restructures
+# a record's subrecords into schema order and -- once the record is marked
+# modified -- ``Record._flatten_children`` re-sorts them on serialize, which
+# would move bytes and break chim's byte-exactness contract (see ``ops.load``'s
+# no-``set_game`` note). We only *read* the schema (via a throwaway registry
+# lookup) to locate FormID offsets, then patch the raw subrecord bytes in place.
+
+
+def _tes5_registry():
+    """The tes5 (Skyrim LE/SE) game registry, for schema lookups only.
+
+    esplib auto-registers it on import of ``esplib.defs.tes5``; importing the
+    module here guarantees it is populated before we ask for it.
+    """
+    from esplib.defs import tes5 as _tes5  # noqa: F401  (import for side effect)
+    from esplib.defs.game import GameRegistry
+    return GameRegistry.get_game("tes5")
+
+
+def _walk_form_ids(plug: Plugin, callback) -> None:
+    """Visit every FormID in ``plug`` and rewrite it via ``callback``.
+
+    ``callback(fid: int) -> Optional[int]``: return a new 32-bit FormID to
+    rewrite it, or ``None`` to leave it unchanged. Visits, for every record:
+
+      * the record's own ``form_id``;
+      * each FormID-typed subrecord field per the tes5 schema -- a bare
+        ``EspFormID``, every element of an ``EspArray`` of ``EspFormID`` (KWDA,
+        etc.), FormID members inside an ``EspStruct``, and the FormIDs embedded
+        in ``EspAlternateTextures`` (MO2S/MO3S/MO4S/MO5S);
+      * FLST's ``LNAM`` forms -- the tes5 schema models each ``LNAM`` as its own
+        single-FormID subrecord (not one array subrecord), so the per-subrecord
+        walk covers the whole form list naturally;
+      * VMAD Papyrus FormIDs (object/array/struct properties, alias objects);
+      * the TES4 header's ``ONAM`` overridden-record FormID array.
+
+    Compressed records need no special handling: esplib decompresses a record's
+    payload into ``record.subrecords`` on load, so we see and patch the same
+    ``SubRecord`` objects; marking one ``modified`` (via ``set_uint32``) makes
+    ``Record.to_bytes`` transparently recompress on serialize.
+
+    Never touches a byte that the schema does not type as a FormID.
+    """
+    from esplib.defs.types import (
+        EspFormID, EspStruct, EspArray, EspAlternateTextures)
+
+    registry = _tes5_registry()
+
+    def remap_at(sr: SubRecord, offset: int) -> None:
+        if offset + 4 > sr.size:
+            return
+        old = struct.unpack_from("<I", sr.data, offset)[0]
+        new = callback(old)
+        if new is not None and new != old:
+            buf = bytearray(sr.data)
+            struct.pack_into("<I", buf, offset, new & 0xFFFFFFFF)
+            sr.data = buf
+            sr.modified = True
+
+    def remap_struct(sr: SubRecord, struct_def) -> None:
+        offset = 0
+        for field in struct_def.members:
+            if isinstance(field, EspFormID):
+                remap_at(sr, offset)
+            size = getattr(field, "byte_size", None)
+            if size is None:
+                size = getattr(field, "size", None)
+            if size is None:
+                break  # variable-size field: cannot safely walk past it
+            offset += size
+
+    def remap_alt_textures(sr: SubRecord) -> None:
+        # uint32 count, then count * (uint32 name_len, name, uint32 FormID,
+        # uint32 3D index).
+        if sr.size < 4:
+            return
+        count = struct.unpack_from("<I", sr.data, 0)[0]
+        offset = 4
+        for _ in range(count):
+            if offset + 4 > sr.size:
+                break
+            name_len = struct.unpack_from("<I", sr.data, offset)[0]
+            offset += 4 + name_len
+            if offset + 4 > sr.size:
+                break
+            remap_at(sr, offset)   # the TXST FormID
+            offset += 4
+            offset += 4            # 3D index
+
+    def remap_vmad(rec: Record) -> None:
+        vmad_sr = rec.get_subrecord("VMAD")
+        if vmad_sr is None:
+            return
+        try:
+            v = _vmad.VmadData.parse(vmad_sr.data, rec.signature)
+        except Exception:
+            # A VMAD the parser cannot model (e.g. FO4 property types). Leaving
+            # the bytes verbatim is only correct if none of its embedded FormIDs
+            # would move -- but a master delete can move them. Refuse rather than
+            # silently corrupt: surface it to the caller.
+            raise OpsError(
+                f"cannot parse VMAD on {rec.signature} "
+                f"{_hexid(rec.form_id.value)} to renumber its FormIDs; "
+                "clear/rewrite the script refs first")
+        changed = False
+
+        def cb(fid: int) -> int:
+            nonlocal changed
+            new = callback(fid)
+            if new is not None and new != fid:
+                changed = True
+                return new & 0xFFFFFFFF
+            return fid
+
+        v.remap_form_ids(cb)
+        if changed:
+            vmad_sr.data = bytearray(v.to_bytes(rec.signature))
+            vmad_sr.modified = True
+
+    def remap_record(rec: Record) -> None:
+        # (a) the record's own FormID
+        new_self = callback(rec.form_id.value)
+        if new_self is not None and new_self != rec.form_id.value:
+            rec.form_id = FormID(new_self & 0xFFFFFFFF)
+            rec.modified = True
+
+        schema = registry.get(rec.signature) if registry is not None else None
+        for sr in rec.subrecords:
+            if sr.signature == "VMAD":
+                continue  # handled structurally below
+            if sr.size < 4:
+                continue
+
+            member = schema.get_member(sr.signature) if schema is not None \
+                else None
+            if member is not None:
+                # Authoritative: esplib schema types this subrecord.
+                vdef = member.value_def
+                if isinstance(vdef, EspFormID):
+                    remap_at(sr, 0)
+                elif isinstance(vdef, EspArray):
+                    if isinstance(vdef.element, EspFormID):
+                        for off in range(0, sr.size - (sr.size % 4), 4):
+                            remap_at(sr, off)
+                elif isinstance(vdef, EspStruct):
+                    remap_struct(sr, vdef)
+                elif isinstance(vdef, EspAlternateTextures):
+                    remap_alt_textures(sr)
+                continue
+
+            # No schema member (record type unregistered, or a subrecord the
+            # schema omits): fall back to the curated placement/CELL formID
+            # table. Its offsets are exact, so this stays formID-only.
+            layout = _FORMID_SUBREC_LAYOUT.get(sr.signature)
+            if layout is None:
+                continue
+            if layout[0] == "array":
+                for off in range(0, sr.size - (sr.size % 4), 4):
+                    remap_at(sr, off)
+            else:  # ("fids", (offsets...))
+                for off in layout[1]:
+                    remap_at(sr, off)
+
+        remap_vmad(rec)
+
+    for rec in _iter_records(plug):
+        remap_record(rec)
+
+    # The TES4 header's ONAM is an array of overridden-record FormIDs (present on
+    # ESM masters). It lives on the raw header record, which is not in the tes5
+    # record registry, so handle it explicitly.
+    hdr = plug.header._raw_record
+    if hdr is not None:
+        onam = hdr.get_subrecord("ONAM")
+        if onam is not None and onam.size >= 4:
+            for off in range(0, onam.size - (onam.size % 4), 4):
+                remap_at(onam, off)
+
+
+def delete_master(plug: Plugin, name: str) -> List[str]:
+    """Remove master ``name`` from the header, cascade-renumbering every FormID.
+
+    The high byte of a FormID is its master index in ``header.masters``
+    (0-based); the plugin's own records use index ``len(masters)``. Removing the
+    master at index ``N`` therefore requires rewriting the high byte of EVERY
+    FormID in the plugin whose index is ``> N`` (decrement by one) so it keeps
+    pointing at the same master / at this plugin. This covers record self-IDs,
+    schema-typed subrecord FormIDs (incl. FLST forms and KWDA-style arrays),
+    VMAD Papyrus refs, and the header ONAM array (see ``_walk_form_ids``).
+
+    Refuses (``OpsError``) if the master is absent, or if ANY live FormID still
+    references it (high byte == ``N``): deleting a still-referenced master would
+    corrupt every such reference, so the caller must clear those refs first. Also
+    refuses on an ESL/light plugin, whose FE-prefixed FormID layout this
+    whole-byte-index model does not describe.
+
+    Returns the resulting master list.
+    """
+    if getattr(plug.header, "is_esl", False):
+        raise OpsError(
+            "delete_master refuses ESL/light plugins (FE-prefixed FormID "
+            "layout is not a whole-byte master index)")
+
+    lowered = [m.lower() for m in plug.header.masters]
+    if name.lower() not in lowered:
+        raise OpsError(f"master {name!r} not found in {plug.header.masters!r}")
+    n = lowered.index(name.lower())
+
+    # 1) Scan (via the identical typed walk the renumber uses) for any live
+    #    reference to the master being deleted (high byte == N). Using the same
+    #    enumeration for scan and renumber guarantees consistency: every formID
+    #    the renumber would touch is exactly what the scan inspects, so we never
+    #    renumber a ref to a master we did not first prove is unreferenced.
+    offenders: List[str] = []
+
+    def _scan(fid: int):
+        if ((fid >> 24) & 0xFF) == n and len(offenders) < 8:
+            offenders.append(_hexid(fid))
+        return None  # scan only: never mutate
+
+    _walk_form_ids(plug, _scan)
+    if offenders:
+        raise OpsError(
+            f"master {name!r} (index {n}) is still referenced by live "
+            f"FormID(s): {', '.join(offenders)}"
+            f"{' ...' if len(offenders) >= 8 else ''} -- clear these refs "
+            "before deleting the master")
+
+    # 2) Drop the master from the header model (masters + sizes lists).
+    del plug.header.masters[n]
+    if n < len(plug.header.master_sizes):
+        del plug.header.master_sizes[n]
+
+    # 3) Drop the matching MAST subrecord and its paired DATA from _raw_record.
+    #    MAST/DATA subrecords are emitted in pairs in master order (mirror of
+    #    add_master, in reverse): remove the N-th MAST and the DATA that follows.
+    rr = plug.header._raw_record
+    mast_seen = -1
+    del_idx = None
+    for i, sr in enumerate(rr.subrecords):
+        if sr.signature == "MAST":
+            mast_seen += 1
+            if mast_seen == n:
+                del_idx = i
+                break
+    if del_idx is None:
+        raise OpsError(
+            f"header MAST subrecord for index {n} not found "
+            "(header/model desync)")
+    # Remove the MAST, then the immediately following DATA if present.
+    to_remove = [del_idx]
+    if (del_idx + 1 < len(rr.subrecords)
+            and rr.subrecords[del_idx + 1].signature == "DATA"):
+        to_remove.append(del_idx + 1)
+    for i in sorted(to_remove, reverse=True):
+        del rr.subrecords[i]
+
+    # 4) Cascade renumber: every FormID with high byte > N drops by one.
+    def _renumber(fid: int):
+        hi = (fid >> 24) & 0xFF
+        if hi > n:
+            return ((hi - 1) << 24) | (fid & 0x00FFFFFF)
+        return None
+
+    _walk_form_ids(plug, _renumber)
+
     plug.modified = True
     return list(plug.header.masters)
 

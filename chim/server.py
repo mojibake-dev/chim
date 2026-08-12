@@ -1018,6 +1018,40 @@ def esp_rename_master(
     }
 
 
+@mcp.tool()
+def esp_delete_master(plugin: str, master_name: str) -> Dict[str, Any]:
+    """Remove a master from the plugin header, cascade-renumbering all formIDs.
+
+    The high byte of a formID is its master index; the plugin's own records use
+    index ``len(masters)``. Removing the master at index ``N`` rewrites the high
+    byte of EVERY formID whose index is ``> N`` (decrement by one) so it keeps
+    pointing at the same master / at this plugin -- covering record self-IDs,
+    schema-typed subrecord formIDs (incl. FLST forms + KWDA-style arrays), VMAD
+    Papyrus refs, and the header ONAM array.
+
+    REFUSES (no write) if the master is absent, if ANY live formID still
+    references it (high byte == ``N`` -- deleting it would corrupt those refs;
+    clear them first), or on an ESL/light plugin (its FE-prefixed formID layout
+    is not a whole-byte master index). Runs inside a safety transaction (lock ->
+    backup -> edit -> verify walk-clean -> restore-on-dirty). Returns the
+    resulting ``masters`` list.
+    """
+    host = _make_host()
+    path = _resolve(host, plugin)
+
+    with safety.transaction(host, path) as txn:
+        plug = ops.load(txn.data)
+        masters = ops.delete_master(plug, str(master_name))
+        txn.data = ops.serialize(plug)
+
+    return {
+        "plugin": path,
+        "master": str(master_name),
+        "masters": masters,
+        "backup": txn.backup_path,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Papyrus compilation
 # --------------------------------------------------------------------------- #

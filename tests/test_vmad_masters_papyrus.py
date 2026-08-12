@@ -30,7 +30,7 @@ from chim.esp.records import walk_clean
 from chim import server
 
 from esplib.record import Record
-from esplib.utils import FormID
+from esplib.utils import FormID, compress_zlib
 from esplib.vmad import (
     VmadData, VmadScript, VmadProperty, VmadObject, VmadAliasScripts,
     VmadFragmentData, VmadQuestFragment,
@@ -454,3 +454,295 @@ def test_tool_papyrus_compile_no_host_raises(monkeypatch):
     _patch_host(monkeypatch, safety.LocalHost())
     with pytest.raises(ValueError):
         server.papyrus_compile("MyScript")
+
+
+# --------------------------------------------------------------------------- #
+# delete_master -- cascade FormID renumber (the correctness-critical one)
+# --------------------------------------------------------------------------- #
+#
+# sample.esp has no masters (its own records use plugin index 0x00), so it is
+# useless for exercising a cross-master renumber. We synthesize small but real
+# multi-master plugins here, byte by byte, the same way fixtures/make_fixture.py
+# does. Each walks clean (parse -> serialize byte-identical) before we touch it.
+
+_TS_VC = 0x00000000
+_IVERSION = 0x002C
+_UNK16 = 0x0000
+_FLAG_COMPRESSED = 0x00040000
+
+
+def _sub(sig: bytes, payload: bytes) -> bytes:
+    return sig + struct.pack("<H", len(payload)) + payload
+
+
+def _rec(sig: bytes, fid: int, payload: bytes, flags: int = 0) -> bytes:
+    header = sig + struct.pack(
+        "<IIIIHH", len(payload), flags, fid, _TS_VC, _IVERSION, _UNK16)
+    return header + payload
+
+
+def _grp(label: bytes, group_type: int, children: bytes) -> bytes:
+    header = b"GRUP" + struct.pack(
+        "<I4siIH", 24 + len(children), label, group_type, _TS_VC, _UNK16
+    ) + struct.pack("<H", 0)
+    return header + children
+
+
+def _tes4(masters, num_records, next_obj=0x800) -> bytes:
+    """A TES4 header carrying the given master names (each with a paired DATA).
+
+    ``num_records`` (HEDR) = count of records + groups EXCLUDING the TES4 header;
+    esplib recomputes it on serialize, so it must match the tree for the raw
+    fixture to round-trip byte-identical.
+    """
+    hedr = struct.pack("<fiI", 1.71, num_records, next_obj)
+    data = _sub(b"HEDR", hedr) + _sub(b"CNAM", b"chim\x00")
+    for m in masters:
+        data += _sub(b"MAST", m.encode("cp1252") + b"\x00")
+        data += _sub(b"DATA", struct.pack("<Q", 0))
+    return _rec(b"TES4", 0x00000000, data)
+
+
+def _fid(master_idx: int, obj: int) -> int:
+    return ((master_idx & 0xFF) << 24) | (obj & 0x00FFFFFF)
+
+
+def _flst(fid: int, lnam_fids, compressed: bool = False) -> bytes:
+    """An FLST record: EDID + one LNAM subrecord per form (the tes5 schema models
+    each LNAM as its own single-FormID subrecord, so this exercises the whole
+    form list). Optionally emitted as a compressed record."""
+    subs = _sub(b"EDID", b"TestList\x00")
+    for lf in lnam_fids:
+        subs += _sub(b"LNAM", struct.pack("<I", lf))
+    if compressed:
+        payload = struct.pack("<I", len(subs)) + compress_zlib(subs)
+        return _rec(b"FLST", fid, payload, flags=_FLAG_COMPRESSED)
+    return _rec(b"FLST", fid, subs)
+
+
+def test_delete_master_identity_add_then_delete_end():
+    """IDENTITY: on a plugin with real masters, add a dummy at the top of the
+    master list, then delete it -> byte-identical to the original. Adding at the
+    end lands the dummy at the highest master index; deleting it decrements
+    nothing (no ref has a higher index), so the bytes must be restored exactly."""
+    # Two masters A(0), B(1); self-index 2. One FLST that is an OVERRIDE of A
+    # (self high byte 0) referencing A(0) and B(1) -- no ref sits at the dummy's
+    # future index (2), so the add is a clean append.
+    flst = _flst(_fid(0, 0x0500), [_fid(0, 0x0A00), _fid(1, 0x0B00)])
+    raw = _tes4(["A.esm", "B.esm"], 2) + _grp(b"FLST", 0, flst)
+
+    plug = ops.load(raw)
+    assert ops.serialize(plug) == raw  # fixture walks clean
+
+    ops.add_master(plug, "Dummy.esm")
+    assert plug.header.masters == ["A.esm", "B.esm", "Dummy.esm"]
+    after_add = ops.serialize(plug)
+
+    plug2 = ops.load(after_add)
+    masters = ops.delete_master(plug2, "Dummy.esm")
+    assert masters == ["A.esm", "B.esm"]
+    out = ops.serialize(plug2)
+    assert walk_clean(out)
+    assert out == raw  # byte-exact inverse of add_master
+
+
+def test_delete_master_renumbers_mid_list():
+    """RENUMBER: deleting a MID-list master decrements every higher index by one
+    (refs to lower masters and the self-index shift correctly), and leaves the
+    lower-index ref untouched."""
+    # Three masters A(0), B(1), C(2); self-index 3. One self-owned FLST
+    # (form_id at index 3) whose LNAM forms reference B(1), C(2) and itself(3).
+    # There is NO ref to A(0), so deleting A is allowed.
+    self_fid = _fid(3, 0x0500)
+    flst = _flst(self_fid, [_fid(1, 0x0B00), _fid(2, 0x0C00), self_fid])
+    raw = _tes4(["A.esm", "B.esm", "C.esm"], 2) + _grp(b"FLST", 0, flst)
+
+    plug = ops.load(raw)
+    assert ops.serialize(plug) == raw
+
+    masters = ops.delete_master(plug, "A.esm")  # remove index 0
+    assert masters == ["B.esm", "C.esm"]
+    out = ops.serialize(plug)
+    assert walk_clean(out)
+
+    re = ops.load(out)
+    # self-index 3 -> 2
+    rec = re.get_record_by_form_id(_fid(2, 0x0500))
+    assert rec is not None
+    assert rec.form_id.value == _fid(2, 0x0500)
+    lnam = [sr for sr in rec.subrecords if sr.signature == "LNAM"]
+    vals = [struct.unpack("<I", sr.data)[0] for sr in lnam]
+    # B(1)->0, C(2)->1, self(3)->2
+    assert vals == [_fid(0, 0x0B00), _fid(1, 0x0C00), _fid(2, 0x0500)]
+    # And the deleted master is gone from the header MAST subrecords.
+    mast = [sr.get_string() for sr in re.header._raw_record.subrecords
+            if sr.signature == "MAST"]
+    assert mast == ["B.esm", "C.esm"]
+
+
+def test_delete_master_preserves_lower_index_refs():
+    """A ref to a master BELOW the deleted index must not move; only >-index refs
+    decrement. Deleting the last master (index 2 of 3) touches only self-refs."""
+    # A(0), B(1), C(2); self 3. FLST refs A(0) and B(1) and self(3); delete C(2).
+    self_fid = _fid(3, 0x0700)
+    flst = _flst(self_fid, [_fid(0, 0x0A00), _fid(1, 0x0B00), self_fid])
+    raw = _tes4(["A.esm", "B.esm", "C.esm"], 2) + _grp(b"FLST", 0, flst)
+
+    plug = ops.load(raw)
+    masters = ops.delete_master(plug, "C.esm")  # highest master index
+    assert masters == ["A.esm", "B.esm"]
+    re = ops.load(ops.serialize(plug))
+    rec = re.get_record_by_form_id(_fid(2, 0x0700))  # self 3 -> 2
+    vals = [struct.unpack("<I", sr.data)[0]
+            for sr in rec.subrecords if sr.signature == "LNAM"]
+    # A(0) unchanged, B(1) unchanged, self(3)->2
+    assert vals == [_fid(0, 0x0A00), _fid(1, 0x0B00), _fid(2, 0x0700)]
+
+
+def test_delete_master_renumbers_compressed_record():
+    """A compressed record's embedded FormIDs renumber too (esplib decompresses
+    on load, so the walk sees them; the record recompresses on serialize)."""
+    self_fid = _fid(3, 0x0500)
+    flst = _flst(self_fid, [_fid(2, 0x0C00)], compressed=True)
+    raw = _tes4(["A.esm", "B.esm", "C.esm"], 2) + _grp(b"FLST", 0, flst)
+
+    plug = ops.load(raw)
+    assert ops.serialize(plug) == raw
+    ops.delete_master(plug, "A.esm")  # C(2)->1, self(3)->2
+    re = ops.load(ops.serialize(plug))
+    rec = re.get_record_by_form_id(_fid(2, 0x0500))
+    assert rec.is_compressed  # stayed compressed
+    lnam = [sr for sr in rec.subrecords if sr.signature == "LNAM"][0]
+    assert struct.unpack("<I", lnam.data)[0] == _fid(1, 0x0C00)
+
+
+def test_delete_master_renumbers_vmad_and_placement():
+    """VMAD Papyrus FormIDs AND placement subrecords (NAME base, XLKR links) --
+    on record types esplib does NOT schema-register -- renumber via the curated
+    fallback table + the VMAD walk."""
+    # ACTI (unregistered) with a VMAD object property -> C(2).
+    v = VmadData(version=5, obj_format=2)
+    scr = VmadScript(name="S", flags=0)
+    scr.properties.append(
+        VmadProperty("Door", PROP_OBJECT, 1, VmadObject(_fid(2, 0x0C00), -1, 0)))
+    v.scripts.append(scr)
+    acti = _rec(b"ACTI", _fid(3, 0x0500),
+                _sub(b"EDID", b"A\x00") + _sub(b"VMAD", v.to_bytes("ACTI")))
+    # REFR (unregistered) placing a base from C via NAME, XLKR keyword B + ref C.
+    refr = _rec(b"REFR", _fid(3, 0x0600),
+                _sub(b"NAME", struct.pack("<I", _fid(2, 0x0D00)))
+                + _sub(b"XLKR",
+                       struct.pack("<II", _fid(1, 0x0E00), _fid(2, 0x0F00))))
+    raw = (_tes4(["A.esm", "B.esm", "C.esm"], 4)  # 2 groups + 2 records
+           + _grp(b"ACTI", 0, acti) + _grp(b"REFR", 0, refr))
+
+    plug = ops.load(raw)
+    ops.delete_master(plug, "A.esm")  # B(1)->0, C(2)->1, self(3)->2
+    re = ops.load(ops.serialize(plug))
+
+    acti2 = re.get_record_by_form_id(_fid(2, 0x0500))
+    vd = VmadData.parse(acti2.get_subrecord("VMAD").data, "ACTI")
+    assert vd.scripts[0].properties[0].value.form_id == _fid(1, 0x0C00)
+
+    refr2 = re.get_record_by_form_id(_fid(2, 0x0600))
+    assert struct.unpack("<I", refr2.get_subrecord("NAME").data)[0] == \
+        _fid(1, 0x0D00)
+    kw, ref = struct.unpack("<II", refr2.get_subrecord("XLKR").data)
+    assert kw == _fid(0, 0x0E00)   # keyword B(1)->0
+    assert ref == _fid(1, 0x0F00)  # ref C(2)->1
+
+
+def test_delete_master_refuses_when_referenced():
+    """REFUSE: deleting a master that still has a live reference raises."""
+    # A(0), B(1); FLST refs B. Deleting B must refuse.
+    flst = _flst(_fid(2, 0x0500), [_fid(1, 0x0B00)])
+    raw = _tes4(["A.esm", "B.esm"], 2) + _grp(b"FLST", 0, flst)
+    plug = ops.load(raw)
+    with pytest.raises(ops.OpsError) as ei:
+        ops.delete_master(plug, "B.esm")
+    assert "still referenced" in str(ei.value)
+    # And the plugin was not partially mutated (still two masters, ref intact).
+    assert plug.header.masters == ["A.esm", "B.esm"]
+
+
+def test_delete_master_missing_raises():
+    """Deleting a master that is not present raises OpsError."""
+    raw = _tes4(["A.esm"], 2) + _grp(b"FLST", 0, _flst(_fid(1, 0x0500), []))
+    plug = ops.load(raw)
+    with pytest.raises(ops.OpsError):
+        ops.delete_master(plug, "NotAMaster.esm")
+
+
+def test_delete_master_refuses_esl():
+    """An ESL/light plugin's FE-prefixed FormID layout is not a whole-byte
+    master index, so delete_master refuses it outright."""
+    raw = _tes4(["A.esm"], 2) + _grp(b"FLST", 0, _flst(_fid(1, 0x0500), []))
+    plug = ops.load(raw)
+    plug.header.is_esl = True
+    with pytest.raises(ops.OpsError):
+        ops.delete_master(plug, "A.esm")
+
+
+def test_delete_master_does_not_mistake_race_name_string_for_formid():
+    """The curated placement/CELL FormID table is only consulted when the schema
+    does NOT type a subrecord. RACE *is* schema-registered and its NAME is an
+    EspString (skeleton path), not a FormID -- so a 4-byte NAME whose bytes look
+    like a high-index FormID must NOT be renumbered. Guards the schema-overrides-
+    curated-table invariant."""
+    # RACE NAME = the 4-char string "\x02\x00\x03m" would be misread as a FormID
+    # at index 3 if the curated NAME entry wrongly applied. Use a NAME string
+    # whose 4 bytes decode as high byte 0x03 (== self-index here) to prove it is
+    # left untouched. RACE has no masters-referencing content otherwise.
+    name_bytes = b"path"  # 4 raw bytes; byte[3]='h'=0x68 -> would be index 0x68
+    race = _rec(b"RACE", _fid(3, 0x0500),
+                _sub(b"EDID", b"R\x00") + _sub(b"NAME", name_bytes))
+    raw = _tes4(["A.esm", "B.esm", "C.esm"], 2) + _grp(b"RACE", 0, race)
+    plug = ops.load(raw)
+    assert ops.serialize(plug) == raw
+
+    ops.delete_master(plug, "A.esm")  # self 3 -> 2; NAME must stay verbatim
+    re = ops.load(ops.serialize(plug))
+    rec = re.get_record_by_form_id(_fid(2, 0x0500))
+    assert rec is not None
+    # The NAME string bytes are UNCHANGED (not renumbered as a FormID).
+    assert rec.get_subrecord("NAME").data == name_bytes
+
+
+def test_delete_master_end_to_end_tool(monkeypatch, tmp_path):
+    """The esp_delete_master MCP tool: add a dummy master through the real tool,
+    then delete it, both through a safety.transaction on a LocalHost temp copy;
+    the file must walk clean and be byte-restored."""
+    raw = (_tes4(["A.esm", "B.esm"], 2)
+           + _grp(b"FLST", 0,
+                  _flst(_fid(0, 0x0500), [_fid(0, 0x0A00), _fid(1, 0x0B00)])))
+    path = os.path.join(str(tmp_path), "DelMod.esp")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+    _patch_host(monkeypatch, safety.LocalHost())
+    server.esp_add_master(path, "Dummy.esm")
+    res = server.esp_delete_master(path, "Dummy.esm")
+    assert res["masters"] == ["A.esm", "B.esm"]
+    assert res["backup"].endswith(".bak")
+
+    with open(path, "rb") as fh:
+        data = fh.read()
+    assert walk_clean(data)
+    assert data == raw  # add + delete round-trips byte-exact
+
+
+def test_delete_master_tool_refuses_referenced(monkeypatch, tmp_path):
+    """The tool surfaces the refuse-on-live-reference as a ValueError (OpsError
+    subclasses ValueError) and leaves the file untouched."""
+    raw = (_tes4(["A.esm", "B.esm"], 2)
+           + _grp(b"FLST", 0, _flst(_fid(2, 0x0500), [_fid(1, 0x0B00)])))
+    path = os.path.join(str(tmp_path), "RefMod.esp")
+    with open(path, "wb") as fh:
+        fh.write(raw)
+
+    _patch_host(monkeypatch, safety.LocalHost())
+    with pytest.raises(ValueError):
+        server.esp_delete_master(path, "B.esm")
+    # File unchanged (transaction restored / never committed a bad write).
+    with open(path, "rb") as fh:
+        assert fh.read() == raw
