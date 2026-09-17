@@ -55,7 +55,7 @@ def _build_heap() -> bytes:
     # mid: empty ReferenceMap, ArrayMap, papyrusRuntime EID, ActiveScriptMap, gap
     w += struct.pack("<I", 0)                           # nref
     w += struct.pack("<I", 0)                           # narr
-    w += struct.pack("<Q", 0)                           # papyrusRuntime
+    w += struct.pack("<I", 0)                           # papyrusRuntime (EID32)
     w += struct.pack("<I", 0)                           # nact
     w += struct.pack("<I", 0)                           # gap
     # instance data blocks (eid 1 and 2 have data; eid 3 does not)
@@ -113,6 +113,9 @@ def test_heap_roundtrips_byte_exact():
     assert len(h.scripts) == 2
     assert len(h.instances) == 3
     assert len(h.inst_data) == 2          # eid 3 has no data block
+    # pins the mid-section layout: nref(4) + narr(4) + runtimeEID(4) + nact(4) + gap(4).
+    # A u64 runtimeEID still round-trips (mid is kept raw) but shifts every later read by 4.
+    assert len(h.mid) == 20
     assert h.to_bytes() == block
     assert h.roundtrips()
 
