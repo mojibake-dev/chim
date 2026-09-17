@@ -135,8 +135,8 @@ class PapyrusHeap:
             if t == 1:
                 r.u32()
             r.u32()
-        r.u64()                                        # papyrusRuntime EID
-        nact = r.u32(); r.o += nact * 5                # ActiveScript header = EID32 + type
+        r.u32()                                        # papyrusRuntime EID (EID32: u64 here
+        nact = r.u32(); r.o += nact * 5                #   shifts the instance-data scan by 4)
         r.u32()                                        # 4-byte gap before instance data
         self.mid = block[mid_start:r.o]
 
